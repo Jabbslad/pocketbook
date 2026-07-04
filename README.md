@@ -6,9 +6,10 @@ Start here:
 
 - Agent/developer notes: [`AGENTS.md`](AGENTS.md)
 - InkView app development guide: [`docs/inkview-app-development.md`](docs/inkview-app-development.md)
+- RSS reader design system: [`docs/rss-reader-design-system.html`](docs/rss-reader-design-system.html)
 - Minimal app example: [`examples/hello-inkview/`](examples/hello-inkview/)
 - RSS reader UI mockup: [`examples/rss-reader-mockup/`](examples/rss-reader-mockup/)
-- RSS reader "Journal" design: [`examples/rss-reader-journal/`](examples/rss-reader-journal/)
+- RSS reader "Journal" design implementation: [`examples/rss-reader-journal/`](examples/rss-reader-journal/)
 
 ## Build the example
 
@@ -52,7 +53,7 @@ The mockup includes Home, Inbox, Reader, and Saved screens. It avoids on-screen 
 
 ## RSS reader — Journal design
 
-Implementation of the "RSS Reader - PocketBook Era" design doc (Journal direction, three screens: feed list, article list, reading view). Pure black on white, Liberation Serif, 7-row lists, hardware page buttons turn pages, touch selects/opens.
+Implementation of the [`RSS Reader - PocketBook Era` design system](docs/rss-reader-design-system.html) (Journal direction, three screens: feed list, article list, reading view). Pure black on white, serif typography, 7-row lists, hardware page buttons turn pages, touch selects/opens.
 
 ```bash
 ./scripts/deploy-rss-journal.sh

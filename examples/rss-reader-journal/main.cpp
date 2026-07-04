@@ -1,8 +1,8 @@
 // RSS Reader — PocketBook Era, "Journal" direction.
-// Implements the three screens from the design doc
-// "RSS Reader - PocketBook Era.dc.html": feed list (1a), article list (1b),
+// Implements the three screens from the design system in
+// docs/rss-reader-design-system.html: feed list (1a), article list (1b),
 // reading view (1c). 1264x1680 grayscale e-ink, pure black on paper white,
-// Liberation Serif throughout, no animation, no status chrome.
+// serif typography, no animation, no status chrome.
 // Hardware page buttons turn pages; touch selects/opens.
 
 #include "inkview.h"

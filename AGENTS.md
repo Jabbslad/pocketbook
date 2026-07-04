@@ -21,6 +21,7 @@ Expected output:
 
 ## Start here
 - Development guide: `docs/inkview-app-development.md`
+- RSS reader design system/source of truth: `docs/rss-reader-design-system.html`
 - Minimal app example: `examples/hello-inkview/`
 - RSS reader UI mockup: `examples/rss-reader-mockup/`
 - RSS reader "Journal" design implementation: `examples/rss-reader-journal/`
