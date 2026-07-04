@@ -12,4 +12,4 @@ include_directories("${FREETYPE_INCLUDE_DIRS}")
 
 add_executable(rss-reader-journal main.cpp)
 set_target_properties(rss-reader-journal PROPERTIES OUTPUT_NAME "rss-reader-journal.app")
-target_link_libraries(rss-reader-journal inkview m)
+target_link_libraries(rss-reader-journal inkview dl m)

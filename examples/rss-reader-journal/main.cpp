@@ -7,9 +7,13 @@
 
 #include "inkview.h"
 
+#include <ctype.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #ifndef DOTS
@@ -236,29 +240,57 @@ Article hackernews[] = {
 
 struct Feed {
     const char *name;
+    const char *url;
     Article *articles;
     int count;
 };
 
-Feed feeds[] = {
-    {"Quanta Magazine", quanta, (int)(sizeof(quanta) / sizeof(quanta[0]))},
-    {"Ars Technica", ars, (int)(sizeof(ars) / sizeof(ars[0]))},
-    {"kottke.org", kottke, (int)(sizeof(kottke) / sizeof(kottke[0]))},
-    {"Daring Fireball", fireball, (int)(sizeof(fireball) / sizeof(fireball[0]))},
-    {"404 Media", media404, (int)(sizeof(media404) / sizeof(media404[0]))},
-    {"NASA Breaking News", nasa, (int)(sizeof(nasa) / sizeof(nasa[0]))},
-    {"Low-Tech Magazine", lowtech, (int)(sizeof(lowtech) / sizeof(lowtech[0]))},
-    {"The Marginalian", marginalian, (int)(sizeof(marginalian) / sizeof(marginalian[0]))},
-    {"BBC Future", bbcfuture, (int)(sizeof(bbcfuture) / sizeof(bbcfuture[0]))},
-    {"Hacker News", hackernews, (int)(sizeof(hackernews) / sizeof(hackernews[0]))},
+const int MAX_FEEDS = 16;
+Article added_articles[MAX_FEEDS] = {
+    {"Welcome to your new feed", "Just now \xC2\xB7 1 min read", true, BODY_SAMPLE},
 };
-const int feed_count = sizeof(feeds) / sizeof(feeds[0]);
+char feed_name_buffers[MAX_FEEDS][80];
+char feed_url_buffers[MAX_FEEDS][160];
+char keyboard_buffer[160];
+int keyboard_feed_idx = -1;
+int keyboard_mode = 0; // 1 name, 2 URL
+int feed_settings_page = 0;
+int editing_feed_idx = -1;
 
-bool saved[16][32];  // per feed, per article; sized above feeds/articles
+const int MAX_FEED_ARTICLES = 20;
+const int MAX_FEED_BYTES = 512 * 1024;
+const int TITLE_BUF = 160;
+const int META_BUF = 96;
+const int BODY_BUF = 4096;
+
+struct FeedArticleStore {
+    Article articles[MAX_FEED_ARTICLES];
+    char titles[MAX_FEED_ARTICLES][TITLE_BUF];
+    char metas[MAX_FEED_ARTICLES][META_BUF];
+    char bodies[MAX_FEED_ARTICLES][BODY_BUF];
+};
+
+FeedArticleStore fetched_feed_store[MAX_FEEDS];
+
+Feed feeds[MAX_FEEDS] = {
+    {"Quanta Magazine", "https://www.quantamagazine.org/feed/", quanta, (int)(sizeof(quanta) / sizeof(quanta[0]))},
+    {"Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", ars, (int)(sizeof(ars) / sizeof(ars[0]))},
+    {"kottke.org", "http://feeds.kottke.org/main", kottke, (int)(sizeof(kottke) / sizeof(kottke[0]))},
+    {"Daring Fireball", "https://daringfireball.net/feeds/main", fireball, (int)(sizeof(fireball) / sizeof(fireball[0]))},
+    {"404 Media", "https://www.404media.co/rss/", media404, (int)(sizeof(media404) / sizeof(media404[0]))},
+    {"NASA Breaking News", "https://www.nasa.gov/news-release/feed/", nasa, (int)(sizeof(nasa) / sizeof(nasa[0]))},
+    {"Low-Tech Magazine", "https://solar.lowtechmagazine.com/feeds/all-en.atom.xml", lowtech, (int)(sizeof(lowtech) / sizeof(lowtech[0]))},
+    {"The Marginalian", "https://www.themarginalian.org/feed/", marginalian, (int)(sizeof(marginalian) / sizeof(marginalian[0]))},
+    {"BBC Future", "https://www.bbc.com/future/feed.rss", bbcfuture, (int)(sizeof(bbcfuture) / sizeof(bbcfuture[0]))},
+    {"Hacker News", "https://news.ycombinator.com/rss", hackernews, (int)(sizeof(hackernews) / sizeof(hackernews[0]))},
+};
+int feed_count = 10;
+
+bool saved[MAX_FEEDS][32];  // per feed, per article; sized above feeds/articles
 
 // ---------------------------------------------------------------- state ---
 
-enum View { VIEW_FEEDS, VIEW_ARTICLES, VIEW_READING };
+enum View { VIEW_FEEDS, VIEW_ARTICLES, VIEW_READING, VIEW_SETTINGS, VIEW_FEED_SETTINGS, VIEW_FEED_EDITOR, VIEW_DIAGNOSTICS };
 
 View view = VIEW_FEEDS;
 int feed_page = 0;
@@ -287,6 +319,13 @@ bool hit(const Zone &z, int x, int y)
 }
 Zone z_sync, z_settings, z_back;
 Zone z_save, z_aa, z_next_article;
+Zone z_settings_feeds, z_settings_diagnostics, z_add_feed;
+Zone z_feed_edit[LIST_ROWS], z_feed_delete[LIST_ROWS];
+Zone z_feed_name, z_feed_url, z_feed_editor_delete;
+const int MAX_LINK_ZONES = 12;
+Zone z_body_links[MAX_LINK_ZONES];
+char z_body_link_urls[MAX_LINK_ZONES][256];
+int body_link_zone_count = 0;
 int release_already_handled = 0;
 char debug_key_line[160] = "key debug: waiting for keypress";
 
@@ -315,6 +354,11 @@ int feed_pages()
 int article_pages()
 {
     return (feeds[sel_feed].count + LIST_ROWS - 1) / LIST_ROWS;
+}
+
+int feed_settings_pages()
+{
+    return (feed_count + LIST_ROWS - 1) / LIST_ROWS;
 }
 
 void refresh_date()
@@ -348,7 +392,11 @@ const char *view_name()
 {
     if (view == VIEW_FEEDS) return "feeds";
     if (view == VIEW_ARTICLES) return "articles";
-    return "reading";
+    if (view == VIEW_READING) return "reading";
+    if (view == VIEW_SETTINGS) return "settings";
+    if (view == VIEW_FEED_SETTINGS) return "feed-settings";
+    if (view == VIEW_FEED_EDITOR) return "feed-editor";
+    return "diagnostics";
 }
 
 void write_key_log(const char *kind, int key, int extra)
@@ -360,6 +408,62 @@ void write_key_log(const char *kind, int key, int extra)
     fprintf(fp, "%s key=%d hex=0x%x extra=%d view=%s feed=%d article=%d read_page=%d\n",
             kind, key, key, extra, view_name(), sel_feed, sel_article, read_page);
     fclose(fp);
+}
+
+void write_sync_log(const char *line)
+{
+    FILE *fp = fopen("/mnt/ext1/rss-reader-journal-sync.log", "a");
+    if (!fp) fp = fopen("/tmp/rss-reader-journal-sync.log", "a");
+    if (!fp) return;
+
+    fprintf(fp, "%s\n", line);
+    fclose(fp);
+}
+
+void write_diag_log(const char *line)
+{
+    FILE *fp = fopen("/mnt/ext1/rss-reader-journal-diagnostics.log", "a");
+    if (!fp) fp = fopen("/tmp/rss-reader-journal-diagnostics.log", "a");
+    if (!fp) return;
+
+    fprintf(fp, "%s\n", line);
+    fclose(fp);
+}
+
+bool probe_library(const char *name, char *out, int cap)
+{
+    void *h = dlopen(name, RTLD_LAZY);
+    if (h) {
+        dlclose(h);
+        snprintf(out, cap, "OK   %s", name);
+        return true;
+    }
+
+    const char *err = dlerror();
+    snprintf(out, cap, "MISS %s%s%s", name, err ? " — " : "", err ? err : "");
+    return false;
+}
+
+void write_diagnostics_log()
+{
+    char line[240];
+    time_t t = time(0);
+    snprintf(line, sizeof(line), "--- diagnostics %ld ---", (long)t);
+    write_diag_log(line);
+    snprintf(line, sizeof(line), "app rss-reader-journal feed_count=%d view=%s", feed_count, view_name());
+    write_diag_log(line);
+    snprintf(line, sizeof(line), "logs: /mnt/ext1/rss-reader-journal-{keys,sync,diagnostics}.log");
+    write_diag_log(line);
+
+    const char *libs[] = {
+        "libcurl.so.4", "libcurl.so", "libxml2.so.2", "libxml2.so",
+        "libssl.so.1.0.0", "libcrypto.so.1.0.0", "liblzma.so.5",
+        "libz.so.1", "libcares.so.2"
+    };
+    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+        probe_library(libs[i], line, sizeof(line));
+        write_diag_log(line);
+    }
 }
 
 void record_key_debug(const char *kind, int key, int extra)
@@ -661,6 +765,237 @@ void draw_articles()
     FullUpdate();
 }
 
+void draw_settings()
+{
+    int w = ScreenWidth();
+
+    ClearScreen();
+
+    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 Feeds",
+         ALIGN_LEFT | VALIGN_TOP);
+    z_back = (Zone){0, 0, 700, 216};
+    text(f_h2_b, PAD, 122, w - PAD * 2, 64, "Settings",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, w - PAD - 420, 168, 420, 36,
+         "Reader preferences", ALIGN_RIGHT | VALIGN_TOP);
+    rule(PAD, 210, w - PAD * 2, 6);
+
+    int y = 216;
+    text(f_40_b, PAD, y + 32, w - PAD * 2 - 120, 52,
+         "Feeds", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 92, w - PAD * 2 - 120, 36,
+         "Add, edit or remove RSS sources", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 80, y, 80, ART_ROW_H,
+         "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_settings_feeds = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40_b, PAD, y + 32, w - PAD * 2 - 120, 52,
+         "Diagnostics", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 92, w - PAD * 2 - 120, 36,
+         "Library probes and sync troubleshooting logs", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 80, y, 80, ART_ROW_H,
+         "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_settings_diagnostics = (Zone){0, y, w, ART_ROW_H};
+
+    FullUpdate();
+}
+
+void draw_diagnostics()
+{
+    int w = ScreenWidth();
+    char line[240];
+    const char *libs[] = {
+        "libcurl.so.4", "libcurl.so", "libxml2.so.2", "libxml2.so",
+        "libssl.so.1.0.0", "libcrypto.so.1.0.0", "liblzma.so.5",
+        "libz.so.1", "libcares.so.2"
+    };
+
+    write_diagnostics_log();
+    ClearScreen();
+
+    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 Settings",
+         ALIGN_LEFT | VALIGN_TOP);
+    z_back = (Zone){0, 0, 700, 216};
+    text(f_h2_b, PAD, 122, w - PAD * 2, 64, "Diagnostics",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, w - PAD - 520, 168, 520, 36,
+         "Logs are written to USB root", ALIGN_RIGHT | VALIGN_TOP);
+    rule(PAD, 210, w - PAD * 2, 6);
+
+    int y = 232;
+    text(f_meta_i, PAD, y, w - PAD * 2, 36,
+         "/rss-reader-journal-diagnostics.log", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    y += 54;
+    text(f_meta_i, PAD, y, w - PAD * 2, 36,
+         "/rss-reader-journal-sync.log", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    y += 68;
+
+    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+        probe_library(libs[i], line, sizeof(line));
+        text(f_nav, PAD, y, w - PAD * 2, 42, line,
+             ALIGN_LEFT | VALIGN_TOP | DOTS);
+        y += 54;
+    }
+
+    FullUpdate();
+}
+
+void draw_feed_settings()
+{
+    int w = ScreenWidth();
+    char buf[160];
+
+    ClearScreen();
+
+    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 Settings",
+         ALIGN_LEFT | VALIGN_TOP);
+    z_back = (Zone){0, 0, 700, 216};
+    text(f_nav, w - PAD - 260, PAD, 260, 38, "+ Add feed",
+         ALIGN_RIGHT | VALIGN_TOP);
+    z_add_feed = (Zone){w - PAD - 300, PAD - 20, 320, 86};
+    text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, "Feeds",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    snprintf(buf, sizeof(buf), "%d added", feed_count);
+    text(f_meta_i, w - PAD - 320, 168, 320, 36, buf,
+         ALIGN_RIGHT | VALIGN_TOP);
+    rule(PAD, 210, w - PAD * 2, 6);
+
+    for (int i = 0; i < LIST_ROWS; ++i) {
+        z_feed_edit[i] = (Zone){0, 0, 0, 0};
+        z_feed_delete[i] = (Zone){0, 0, 0, 0};
+        int idx = feed_settings_page * LIST_ROWS + i;
+        if (idx >= feed_count) break;
+        const Feed &f = feeds[idx];
+        int y = 216 + i * ART_ROW_H;
+
+        text(f_40_b, PAD, y + 24, w - PAD * 2 - 260, 52,
+             f.name, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        text(f_meta_i, PAD, y + 80, w - PAD * 2 - 260, 36,
+             f.url, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        snprintf(buf, sizeof(buf), "%d article%s \xC2\xB7 %d unread",
+                 f.count, f.count == 1 ? "" : "s", feed_unread(f));
+        text(f_hint_i, PAD, y + 118, w - PAD * 2 - 260, 32,
+             buf, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        text(f_nav, w - PAD - 220, y, 90, ART_ROW_H,
+             "Edit", ALIGN_RIGHT | VALIGN_MIDDLE);
+        text(f_nav, w - PAD - 100, y, 100, ART_ROW_H,
+             "Delete", ALIGN_RIGHT | VALIGN_MIDDLE);
+        z_feed_edit[i] = (Zone){0, y, w - PAD - 120, ART_ROW_H};
+        z_feed_delete[i] = (Zone){w - PAD - 120, y, 120, ART_ROW_H};
+        rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    }
+
+    draw_list_footer(feed_settings_page, feed_settings_pages(),
+                     "side buttons scroll feeds");
+    FullUpdate();
+}
+
+bool is_link_paragraph(const char *text, char *url, int cap)
+{
+    const char *p = text;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!strncmp(p, "\xE2\x86\x97 ", 4)) p += 4;
+    else if (!strncmp(p, "-> ", 3)) p += 3;
+    else if (!strncasecmp(p, "Source:", 7)) p += 7;
+
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "http://", 7) && strncmp(p, "https://", 8)) return false;
+    int n = 0;
+    while (p[n] && n + 1 < cap && !isspace((unsigned char)p[n])) n++;
+    while (n > 0 && (p[n - 1] == ')' || p[n - 1] == ']' || p[n - 1] == '.' ||
+                     p[n - 1] == ',' || p[n - 1] == ';')) n--;
+    if (n <= 0) {
+        url[0] = 0;
+        return false;
+    }
+    memcpy(url, p, n);
+    url[n] = 0;
+    return !strncmp(url, "http://", 7) || !strncmp(url, "https://", 8);
+}
+
+void add_body_link_zone(int x, int y, int w, int h, const char *url)
+{
+    if (body_link_zone_count >= MAX_LINK_ZONES) return;
+    z_body_links[body_link_zone_count] = (Zone){x, y, w, h < 72 ? 72 : h};
+    snprintf(z_body_link_urls[body_link_zone_count],
+             sizeof(z_body_link_urls[body_link_zone_count]), "%s", url);
+    body_link_zone_count++;
+}
+
+bool first_article_url(const Article &a, char *url, int cap)
+{
+    const char *https = strstr(a.body, "https://");
+    const char *http = strstr(a.body, "http://");
+    const char *p = 0;
+    if (https && http) p = https < http ? https : http;
+    else p = https ? https : http;
+    if (!p) {
+        url[0] = 0;
+        return false;
+    }
+
+    int n = 0;
+    while (p[n] && n + 1 < cap && !isspace((unsigned char)p[n]) &&
+           p[n] != '<' && p[n] != '"' && p[n] != '\'') n++;
+    while (n > 0 && (p[n - 1] == ')' || p[n - 1] == ']' || p[n - 1] == '.' ||
+                     p[n - 1] == ',' || p[n - 1] == ';')) n--;
+    if (n <= 0) {
+        url[0] = 0;
+        return false;
+    }
+    memcpy(url, p, n);
+    url[n] = 0;
+    return true;
+}
+
+void draw_feed_editor()
+{
+    int w = ScreenWidth();
+    const Feed &f = feeds[editing_feed_idx];
+
+    ClearScreen();
+
+    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 Feeds",
+         ALIGN_LEFT | VALIGN_TOP);
+    z_back = (Zone){0, 0, 700, 216};
+    text(f_h2_b, PAD, 122, w - PAD * 2, 64, "Edit feed",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, w - PAD - 420, 168, 420, 36,
+         "Tap a field to change it", ALIGN_RIGHT | VALIGN_TOP);
+    rule(PAD, 210, w - PAD * 2, 6);
+
+    int y = 216;
+    text(f_40_b, PAD, y + 28, w - PAD * 2, 52,
+         "Name", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 88, w - PAD * 2 - 80, 36,
+         f.name, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 80, y, 80, ART_ROW_H,
+         "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_feed_name = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40_b, PAD, y + 28, w - PAD * 2, 52,
+         "Feed URL", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 88, w - PAD * 2 - 80, 36,
+         f.url, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 80, y, 80, ART_ROW_H,
+         "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_feed_url = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40, PAD, y + 44, w - PAD * 2, 52,
+         "Delete feed", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_feed_editor_delete = (Zone){0, y, w, ART_ROW_H};
+
+    FullUpdate();
+}
+
 void draw_reading()
 {
     int w = ScreenWidth();
@@ -685,11 +1020,21 @@ void draw_reading()
         y = PAD;
     }
 
+    body_link_zone_count = 0;
     SetFont(f_body, C_BLACK);
     for (int i = page_start[read_page]; i < page_start[read_page + 1]; ++i) {
         int ph = TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+        char url[256];
+        bool is_link = is_link_paragraph(paras[i], url, sizeof(url));
         DrawTextRect(READ_PAD, y, cw, ph, (char *)paras[i],
                      ALIGN_LEFT | VALIGN_TOP);
+        if (is_link) {
+            int underline_w = StringWidth((char *)paras[i]);
+            if (underline_w > cw) underline_w = cw;
+            DrawLine(READ_PAD, y + ph + 4, READ_PAD + underline_w, y + ph + 4,
+                     C_BLACK);
+            add_body_link_zone(READ_PAD - 8, y - 12, underline_w + 16, ph + 28, url);
+        }
         y += ph + PARA_GAP;
     }
 
@@ -738,7 +1083,11 @@ void draw_screen()
 {
     if (view == VIEW_FEEDS) draw_feeds();
     else if (view == VIEW_ARTICLES) draw_articles();
-    else draw_reading();
+    else if (view == VIEW_READING) draw_reading();
+    else if (view == VIEW_SETTINGS) draw_settings();
+    else if (view == VIEW_FEED_SETTINGS) draw_feed_settings();
+    else if (view == VIEW_FEED_EDITOR) draw_feed_editor();
+    else draw_diagnostics();
 }
 
 // ------------------------------------------------------------- actions ---
@@ -774,14 +1123,540 @@ void previous_article_or_list()
     }
 }
 
-void do_sync()
+void copy_trimmed(char *dst, int cap, const char *src)
 {
+    if (cap <= 0) return;
+    int out = 0;
+    bool was_space = true;
+    if (!src) src = "";
+    while (*src && out + 1 < cap) {
+        unsigned char c = (unsigned char)*src++;
+        if (c == '\n' || c == '\r') {
+            if (out > 0 && dst[out - 1] != '\n') dst[out++] = '\n';
+            was_space = true;
+        } else if (isspace(c)) {
+            if (!was_space && out > 0 && dst[out - 1] != '\n') dst[out++] = ' ';
+            was_space = true;
+        } else {
+            dst[out++] = (char)c;
+            was_space = false;
+        }
+    }
+    while (out > 0 && (dst[out - 1] == ' ' || dst[out - 1] == '\n')) out--;
+    dst[out] = 0;
+}
+
+void append_limited(char *dst, int cap, const char *src)
+{
+    int len = (int)strlen(dst);
+    if (len + 1 >= cap || !src) return;
+    snprintf(dst + len, cap - len, "%s", src);
+}
+
+void decode_entities(char *s);
+
+void copy_href_from_tag(const char *tag, char *out, int cap)
+{
+    out[0] = 0;
+    const char *gt = strchr(tag, '>');
+    if (!gt) return;
+    for (const char *p = tag; p + 5 < gt; ++p) {
+        if (strncasecmp(p, "href", 4)) continue;
+        p += 4;
+        while (p < gt && isspace((unsigned char)*p)) p++;
+        if (p >= gt || *p != '=') continue;
+        p++;
+        while (p < gt && isspace((unsigned char)*p)) p++;
+        char quote = (*p == '\'' || *p == '"') ? *p++ : ' ';
+        const char *stop = p;
+        while (stop < gt && ((quote == ' ' && !isspace((unsigned char)*stop) && *stop != '>') ||
+                             (quote != ' ' && *stop != quote))) stop++;
+        int n = stop - p;
+        if (n >= cap) n = cap - 1;
+        memcpy(out, p, n);
+        out[n] = 0;
+        decode_entities(out);
+        return;
+    }
+}
+
+void strip_markup(char *dst, int cap, const char *src)
+{
+    char tmp[BODY_BUF];
+    int out = 0;
+    char active_href[256] = "";
+    if (!src) src = "";
+
+    if (!strncmp(src, "<![CDATA[", 9)) src += 9;
+
+    while (*src && out + 1 < (int)sizeof(tmp)) {
+        if (!strncmp(src, "<![CDATA[", 9)) { src += 9; continue; }
+        if (!strncmp(src, "]]>", 3)) { src += 3; continue; }
+        if (!strncmp(src, "[CDATA[", 7)) { src += 7; continue; }
+        if (*src == '<') {
+            if (!strncmp(src, "<![CDATA[", 9)) { src += 9; continue; }
+            const char *tag = src + 1;
+            bool closing = *tag == '/';
+            if (closing) tag++;
+            while (*tag && isspace((unsigned char)*tag)) tag++;
+
+            bool is_anchor = !strncasecmp(tag, "a", 1) &&
+                             (tag[1] == '>' || tag[1] == ' ' || tag[1] == '\t' || tag[1] == '\n');
+            bool block = !strncasecmp(tag, "p", 1) || !strncasecmp(tag, "br", 2) ||
+                         !strncasecmp(tag, "div", 3) || !strncasecmp(tag, "li", 2) ||
+                         !strncasecmp(tag, "tr", 2);
+            if (!closing && is_anchor) {
+                copy_href_from_tag(src, active_href, sizeof(active_href));
+            } else if (closing && is_anchor && active_href[0] && out + 8 < (int)sizeof(tmp)) {
+                if (out > 0 && tmp[out - 1] != '\n') tmp[out++] = '\n';
+                const char *prefix = "\xE2\x86\x97 "; // northeast arrow
+                for (const char *p = prefix; *p && out + 1 < (int)sizeof(tmp); ++p)
+                    tmp[out++] = *p;
+                for (const char *h = active_href; *h && out + 2 < (int)sizeof(tmp); ++h)
+                    tmp[out++] = *h;
+                if (out + 1 < (int)sizeof(tmp)) tmp[out++] = '\n';
+                active_href[0] = 0;
+            }
+            if (block && out > 0 && tmp[out - 1] != '\n') tmp[out++] = '\n';
+            while (*src && *src != '>') src++;
+            if (*src == '>') src++;
+        } else {
+            tmp[out++] = *src++;
+        }
+    }
+    tmp[out] = 0;
+    decode_entities(tmp);
+    copy_trimmed(dst, cap, tmp);
+}
+
+bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
+{
+    int size = 0;
+    int timeout = 30000;
+    int err = 0;
+    void *data = QuickDownloadExt3(url, &size, timeout, NULL, NULL, &err);
+    if (!data || size <= 0) {
+        snprintf(error, error_cap, "download failed (%d)", err);
+        if (data) free(data);
+        return false;
+    }
+    if (size >= cap) {
+        snprintf(error, error_cap, "feed too large");
+        free(data);
+        return false;
+    }
+    memcpy(buffer, data, size);
+    buffer[size] = 0;
+    free(data);
+    return true;
+}
+
+const char *next_tag(const char *p, const char *end, const char *local_name)
+{
+    int want = (int)strlen(local_name);
+    while (p && p < end) {
+        const char *lt = (const char *)memchr(p, '<', end - p);
+        if (!lt || lt + 1 >= end) return NULL;
+        if (lt[1] == '/' || lt[1] == '!' || lt[1] == '?') { p = lt + 1; continue; }
+        const char *name = lt + 1;
+        const char *name_end = name;
+        while (name_end < end && *name_end && !isspace((unsigned char)*name_end) &&
+               *name_end != '>' && *name_end != '/') name_end++;
+        const char *local = name;
+        for (const char *q = name; q < name_end; ++q)
+            if (*q == ':') local = q + 1;
+        if (name_end - local == want && !strncmp(local, local_name, want)) return lt;
+        p = name_end;
+    }
+    return NULL;
+}
+
+const char *tag_content_start(const char *tag, const char *end)
+{
+    const char *gt = (const char *)memchr(tag, '>', end - tag);
+    return gt ? gt + 1 : NULL;
+}
+
+const char *find_close_tag(const char *p, const char *end, const char *local_name)
+{
+    int want = (int)strlen(local_name);
+    while (p && p < end) {
+        const char *lt = (const char *)memchr(p, '<', end - p);
+        if (!lt || lt + 2 >= end) return NULL;
+        if (lt[1] != '/') { p = lt + 1; continue; }
+        const char *name = lt + 2;
+        const char *name_end = name;
+        while (name_end < end && *name_end && !isspace((unsigned char)*name_end) &&
+               *name_end != '>') name_end++;
+        const char *local = name;
+        for (const char *q = name; q < name_end; ++q)
+            if (*q == ':') local = q + 1;
+        if (name_end - local == want && !strncmp(local, local_name, want)) return lt;
+        p = name_end;
+    }
+    return NULL;
+}
+
+void append_utf8(char **w, unsigned codepoint)
+{
+    if (codepoint < 0x80) {
+        *(*w)++ = (char)codepoint;
+    } else if (codepoint < 0x800) {
+        *(*w)++ = (char)(0xC0 | (codepoint >> 6));
+        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+        *(*w)++ = (char)(0xE0 | (codepoint >> 12));
+        *(*w)++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
+    }
+}
+
+void decode_entities(char *s)
+{
+    char *r = s;
+    char *w = s;
+    while (*r) {
+        if (!strncmp(r, "&amp;", 5)) { *w++ = '&'; r += 5; }
+        else if (!strncmp(r, "&lt;", 4)) { *w++ = '<'; r += 4; }
+        else if (!strncmp(r, "&gt;", 4)) { *w++ = '>'; r += 4; }
+        else if (!strncmp(r, "&quot;", 6)) { *w++ = '"'; r += 6; }
+        else if (!strncmp(r, "&apos;", 6)) { *w++ = '\''; r += 6; }
+        else if (!strncmp(r, "&nbsp;", 6)) { *w++ = ' '; r += 6; }
+        else if (!strncmp(r, "&mdash;", 7)) { append_utf8(&w, 0x2014); r += 7; }
+        else if (!strncmp(r, "&ndash;", 7)) { append_utf8(&w, 0x2013); r += 7; }
+        else if (!strncmp(r, "&rsquo;", 7)) { append_utf8(&w, 0x2019); r += 7; }
+        else if (!strncmp(r, "&lsquo;", 7)) { append_utf8(&w, 0x2018); r += 7; }
+        else if (!strncmp(r, "&rdquo;", 7)) { append_utf8(&w, 0x201D); r += 7; }
+        else if (!strncmp(r, "&ldquo;", 7)) { append_utf8(&w, 0x201C); r += 7; }
+        else if (r[0] == '&' && r[1] == '#') {
+            char *end = 0;
+            unsigned code = 0;
+            if (r[2] == 'x' || r[2] == 'X') code = (unsigned)strtoul(r + 3, &end, 16);
+            else code = (unsigned)strtoul(r + 2, &end, 10);
+            if (end && *end == ';' && code > 0 && code < 0x10000) {
+                append_utf8(&w, code);
+                r = end + 1;
+            } else {
+                *w++ = *r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
+void copy_tag_text(const char *start, const char *end, const char *name,
+                   char *out, int cap)
+{
+    out[0] = 0;
+    const char *tag = next_tag(start, end, name);
+    if (!tag) return;
+    const char *content = tag_content_start(tag, end);
+    if (!content) return;
+    const char *close = find_close_tag(content, end, name);
+    if (!close) return;
+    int n = close - content;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, content, n);
+    out[n] = 0;
+    decode_entities(out);
+    copy_trimmed(out, cap, out);
+}
+
+void copy_atom_href(const char *start, const char *end, char *out, int cap)
+{
+    const char *tag = start;
+    while ((tag = next_tag(tag, end, "link"))) {
+        const char *gt = (const char *)memchr(tag, '>', end - tag);
+        if (!gt) return;
+        const char *href = strstr(tag, "href=");
+        if (href && href < gt) {
+            href += 5;
+            char quote = (*href == '\'' || *href == '"') ? *href++ : ' ';
+            const char *stop = href;
+            while (stop < gt && ((quote == ' ' && !isspace((unsigned char)*stop) && *stop != '>') ||
+                                 (quote != ' ' && *stop != quote))) stop++;
+            int n = stop - href;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, href, n);
+            out[n] = 0;
+            decode_entities(out);
+            return;
+        }
+        tag = gt + 1;
+    }
+}
+
+void commit_feed_item(FeedArticleStore &store, int *count,
+                      char *title, char *link, char *date, char *desc)
+{
+    if (*count >= MAX_FEED_ARTICLES) return;
+    int idx = (*count)++;
+    copy_trimmed(store.titles[idx], TITLE_BUF, *title ? title : "Untitled article");
+    copy_trimmed(store.metas[idx], META_BUF, *date ? date : "Fetched just now");
+    strip_markup(store.bodies[idx], BODY_BUF, *desc ? desc : link);
+    if (!store.bodies[idx][0]) copy_trimmed(store.bodies[idx], BODY_BUF, "No summary was provided by this feed.");
+    if (*link && (int)strlen(store.bodies[idx]) < BODY_BUF - 16) {
+        append_limited(store.bodies[idx], BODY_BUF, "\n\xE2\x86\x97 ");
+        append_limited(store.bodies[idx], BODY_BUF, link);
+    }
+    store.articles[idx] = (Article){store.titles[idx], store.metas[idx], true,
+                                    store.bodies[idx]};
+}
+
+int parse_feed_items(int feed_idx, const char *xml, int len, const char *item_name)
+{
+    FeedArticleStore &store = fetched_feed_store[feed_idx];
+    const char *end = xml + len;
+    const char *p = xml;
+    int count = 0;
+    while (count < MAX_FEED_ARTICLES) {
+        const char *tag = next_tag(p, end, item_name);
+        if (!tag) break;
+        const char *content = tag_content_start(tag, end);
+        if (!content) break;
+        const char *close = find_close_tag(content, end, item_name);
+        if (!close) break;
+
+        char title[TITLE_BUF] = "";
+        char link[256] = "";
+        char date[META_BUF] = "";
+        char desc[BODY_BUF] = "";
+        copy_tag_text(content, close, "title", title, sizeof(title));
+        copy_tag_text(content, close, "link", link, sizeof(link));
+        if (!link[0]) copy_atom_href(content, close, link, sizeof(link));
+        copy_tag_text(content, close, "pubDate", date, sizeof(date));
+        if (!date[0]) copy_tag_text(content, close, "updated", date, sizeof(date));
+        if (!date[0]) copy_tag_text(content, close, "published", date, sizeof(date));
+        copy_tag_text(content, close, "encoded", desc, sizeof(desc));
+        if (!desc[0]) copy_tag_text(content, close, "content", desc, sizeof(desc));
+        if (!desc[0]) copy_tag_text(content, close, "description", desc, sizeof(desc));
+        if (!desc[0]) copy_tag_text(content, close, "summary", desc, sizeof(desc));
+        commit_feed_item(store, &count, title, link, date, desc);
+        p = close + 1;
+    }
+    return count;
+}
+
+int parse_feed_xml(int feed_idx, const char *xml, int len)
+{
+    int count = parse_feed_items(feed_idx, xml, len, "item");
+    if (count == 0) count = parse_feed_items(feed_idx, xml, len, "entry");
+    return count;
+}
+
+bool refresh_one_feed(int idx, char *scratch, char *error, int error_cap)
+{
+    if (!fetch_url(feeds[idx].url, scratch, MAX_FEED_BYTES, error, error_cap))
+        return false;
+    int parsed = parse_feed_xml(idx, scratch, (int)strlen(scratch));
+    if (parsed <= 0) {
+        snprintf(error, error_cap, "no articles parsed");
+        return false;
+    }
+    feeds[idx].articles = fetched_feed_store[idx].articles;
+    feeds[idx].count = parsed;
+    memset(saved[idx], 0, sizeof(saved[idx]));
+    return true;
+}
+
+
+void refresh_all_feeds()
+{
+    char *scratch = (char *)malloc(MAX_FEED_BYTES);
+    if (!scratch) {
+        Message(ICON_ERROR, (char *)"Sync failed", (char *)"Not enough memory.", 3000);
+        return;
+    }
+
+    ShowHourglass();
+    OpenProgressbar(ICON_INFORMATION, "Sync now", "Fetching feeds", 0, NULL);
+    write_sync_log("--- sync start ---");
+    int ok = 0;
+    char error[96] = "";
+    char status[240];
+    for (int i = 0; i < feed_count; ++i) {
+        snprintf(status, sizeof(status), "%s", feeds[i].name);
+        UpdateProgressbar(status, (i * 100) / feed_count);
+        error[0] = 0;
+        if (refresh_one_feed(i, scratch, error, sizeof(error))) {
+            ok++;
+            snprintf(status, sizeof(status), "OK %s articles=%d url=%s",
+                     feeds[i].name, feeds[i].count, feeds[i].url);
+        } else {
+            snprintf(status, sizeof(status), "FAIL %s error=%s url=%s",
+                     feeds[i].name, error, feeds[i].url);
+        }
+        write_sync_log(status);
+    }
+    CloseProgressbar();
+    HideHourglass();
+    free(scratch);
+
     time_t t = time(0);
     struct tm *lt = localtime(&t);
-    if (lt) snprintf(sync_str, sizeof(sync_str), "%02d:%02d",
-                     lt->tm_hour, lt->tm_min);
+    if (lt) snprintf(sync_str, sizeof(sync_str), "%02d:%02d", lt->tm_hour, lt->tm_min);
     refresh_date();
+    feed_page = art_page = read_page = 0;
+    view = VIEW_FEEDS;
     draw_screen();
+
+    if (ok == 0) {
+        snprintf(status, sizeof(status), "No feeds updated. Last error: %s", error);
+        Message(ICON_ERROR, (char *)"Sync failed", status, 4000);
+    } else if (ok < feed_count) {
+        snprintf(status, sizeof(status), "%d of %d feeds updated. Last error: %s",
+                 ok, feed_count, error);
+        Message(ICON_INFORMATION, (char *)"Sync partial", status, 4000);
+    }
+}
+
+void rename_feed(int idx, const char *name)
+{
+    if (idx < 0 || idx >= feed_count || !name || !*name) return;
+    snprintf(feed_name_buffers[idx], sizeof(feed_name_buffers[idx]), "%s", name);
+    feeds[idx].name = feed_name_buffers[idx];
+}
+
+void update_feed_url(int idx, const char *url)
+{
+    if (idx < 0 || idx >= feed_count || !url || !*url) return;
+    snprintf(feed_url_buffers[idx], sizeof(feed_url_buffers[idx]), "%s", url);
+    feeds[idx].url = feed_url_buffers[idx];
+}
+
+void feed_keyboard_done(char *text)
+{
+    if (text && *text) {
+        if (keyboard_mode == 1) rename_feed(keyboard_feed_idx, text);
+        else if (keyboard_mode == 2) update_feed_url(keyboard_feed_idx, text);
+    }
+
+    keyboard_mode = 0;
+    keyboard_feed_idx = -1;
+    draw_screen();
+}
+
+void edit_feed(int idx)
+{
+    if (idx < 0 || idx >= feed_count) return;
+    editing_feed_idx = idx;
+    view = VIEW_FEED_EDITOR;
+    draw_screen();
+}
+
+void edit_feed_name()
+{
+    keyboard_mode = 1;
+    keyboard_feed_idx = editing_feed_idx;
+    snprintf(keyboard_buffer, sizeof(keyboard_buffer), "%s", feeds[editing_feed_idx].name);
+    OpenKeyboard("Feed name", keyboard_buffer, sizeof(keyboard_buffer),
+                 KBD_NORMAL, feed_keyboard_done);
+}
+
+void edit_feed_url()
+{
+    keyboard_mode = 2;
+    keyboard_feed_idx = editing_feed_idx;
+    snprintf(keyboard_buffer, sizeof(keyboard_buffer), "%s", feeds[editing_feed_idx].url);
+    OpenKeyboard("Feed URL", keyboard_buffer, sizeof(keyboard_buffer),
+                 KBD_URL, feed_keyboard_done);
+}
+
+void add_feed()
+{
+    if (feed_count >= MAX_FEEDS) {
+        Message(ICON_INFORMATION, (char *)"Feeds",
+                (char *)"This build has reached its feed limit.", 2000);
+        return;
+    }
+
+    int idx = feed_count++;
+    snprintf(feed_name_buffers[idx], sizeof(feed_name_buffers[idx]), "New feed");
+    snprintf(feed_url_buffers[idx], sizeof(feed_url_buffers[idx]),
+             "https://example.com/feed.xml");
+    added_articles[idx] = (Article){"Welcome to your new feed",
+                                    "Not synced yet", true, BODY_SAMPLE};
+    feeds[idx] = (Feed){feed_name_buffers[idx], feed_url_buffers[idx],
+                        &added_articles[idx], 1};
+    memset(saved[idx], 0, sizeof(saved[idx]));
+    feed_settings_page = (feed_count - 1) / LIST_ROWS;
+    edit_feed(idx);
+}
+
+void delete_feed(int idx)
+{
+    if (idx < 0 || idx >= feed_count) return;
+    if (feed_count <= 1) {
+        Message(ICON_INFORMATION, (char *)"Feeds",
+                (char *)"Keep at least one feed.", 2000);
+        return;
+    }
+
+    for (int i = idx; i + 1 < feed_count; ++i) {
+        feeds[i] = feeds[i + 1];
+        snprintf(feed_name_buffers[i], sizeof(feed_name_buffers[i]),
+                 "%s", feeds[i].name);
+        snprintf(feed_url_buffers[i], sizeof(feed_url_buffers[i]),
+                 "%s", feeds[i].url);
+        feeds[i].name = feed_name_buffers[i];
+        feeds[i].url = feed_url_buffers[i];
+        memcpy(saved[i], saved[i + 1], sizeof(saved[i]));
+    }
+    feed_count--;
+    if (editing_feed_idx >= feed_count) editing_feed_idx = feed_count - 1;
+    if (sel_feed >= feed_count) sel_feed = feed_count - 1;
+    if (feed_page >= feed_pages()) feed_page = feed_pages() - 1;
+    if (feed_settings_page >= feed_settings_pages())
+        feed_settings_page = feed_settings_pages() - 1;
+    if (feed_page < 0) feed_page = 0;
+    if (feed_settings_page < 0) feed_settings_page = 0;
+    draw_screen();
+}
+
+void open_url(const char *url)
+{
+    char logline[360];
+    snprintf(logline, sizeof(logline), "open-link url=%s", url);
+    write_diag_log(logline);
+
+    int rc_direct = OpenBook(url, "", 0);
+    snprintf(logline, sizeof(logline), "open-link direct rc=%d", rc_direct);
+    write_diag_log(logline);
+    if (rc_direct == 0) return;
+
+    int rc_browser = OpenBook(BROWSER_FOR_AUTH, url, 0);
+    snprintf(logline, sizeof(logline), "open-link browser-param rc=%d browser=%s",
+             rc_browser, BROWSER_FOR_AUTH);
+    write_diag_log(logline);
+    if (rc_browser == 0) return;
+
+    const char *argv[] = {BROWSER_FOR_AUTH, url};
+    int rc_browser2 = OpenBook2(BROWSER_FOR_AUTH, 2, argv, 0);
+    snprintf(logline, sizeof(logline), "open-link browser-argv rc=%d", rc_browser2);
+    write_diag_log(logline);
+    if (rc_browser2 == 0) return;
+
+    Message(ICON_WARNING, (char *)"Open link",
+            (char *)"Could not open the browser for this link. See diagnostics log.", 4000);
+}
+
+void open_article_link()
+{
+    char url[256];
+    const Article &a = feeds[sel_feed].articles[sel_article];
+    if (!first_article_url(a, url, sizeof(url))) {
+        Message(ICON_INFORMATION, (char *)"Open link",
+                (char *)"This article has no link.", 2000);
+        return;
+    }
+    open_url(url);
+}
+
+void do_sync()
+{
+    refresh_all_feeds();
 }
 
 void cycle_body_size()
@@ -796,6 +1671,8 @@ void cycle_body_size()
         if (page_start[p] <= first && first < page_start[p + 1]) read_page = p;
     draw_screen();
 }
+
+void go_back();
 
 void page_delta(int d)
 {
@@ -816,6 +1693,18 @@ void page_delta(int d)
             view = VIEW_FEEDS;
             draw_screen();
         }
+    } else if (view == VIEW_SETTINGS) {
+        if (d < 0) go_back();
+    } else if (view == VIEW_FEED_SETTINGS) {
+        int next = feed_settings_page + d;
+        if (next >= 0 && next < feed_settings_pages()) {
+            feed_settings_page = next;
+            draw_screen();
+        } else if (d < 0) {
+            go_back();
+        }
+    } else if (view == VIEW_FEED_EDITOR || view == VIEW_DIAGNOSTICS) {
+        if (d < 0) go_back();
     } else {
         int next = read_page + d;
         if (next >= 0 && next < read_pages) {
@@ -835,8 +1724,17 @@ void go_back()
         view = VIEW_ARTICLES;
         art_page = sel_article / LIST_ROWS;
         draw_screen();
-    } else if (view == VIEW_ARTICLES) {
+    } else if (view == VIEW_ARTICLES || view == VIEW_SETTINGS) {
         view = VIEW_FEEDS;
+        draw_screen();
+    } else if (view == VIEW_FEED_SETTINGS) {
+        view = VIEW_SETTINGS;
+        draw_screen();
+    } else if (view == VIEW_FEED_EDITOR) {
+        view = VIEW_FEED_SETTINGS;
+        draw_screen();
+    } else if (view == VIEW_DIAGNOSTICS) {
+        view = VIEW_SETTINGS;
         draw_screen();
     } else {
         CloseApp();
@@ -853,9 +1751,8 @@ void handle_tap(int x, int y)
     if (view == VIEW_FEEDS) {
         if (hit(z_sync, x, y)) { do_sync(); return; }
         if (hit(z_settings, x, y)) {
-            Message(ICON_INFORMATION, (char *)"Settings",
-                    (char *)"Sync interval, font size and mark-all-read "
-                            "live here in the full app.", 2000);
+            view = VIEW_SETTINGS;
+            draw_screen();
             return;
         }
         if (y >= h - LIST_FOOTER_H - 2) {
@@ -892,6 +1789,53 @@ void handle_tap(int x, int y)
         return;
     }
 
+    if (view == VIEW_SETTINGS) {
+        if (hit(z_back, x, y)) { go_back(); return; }
+        if (hit(z_settings_feeds, x, y)) {
+            view = VIEW_FEED_SETTINGS;
+            feed_settings_page = 0;
+            draw_screen();
+        } else if (hit(z_settings_diagnostics, x, y)) {
+            view = VIEW_DIAGNOSTICS;
+            draw_screen();
+        }
+        return;
+    }
+
+    if (view == VIEW_DIAGNOSTICS) {
+        if (hit(z_back, x, y)) { go_back(); return; }
+        return;
+    }
+
+    if (view == VIEW_FEED_SETTINGS) {
+        if (hit(z_back, x, y)) { go_back(); return; }
+        if (hit(z_add_feed, x, y)) { add_feed(); return; }
+        if (y >= h - LIST_FOOTER_H - 2) {
+            if (x < w / 3) page_delta(-1);
+            else if (x > w * 2 / 3) page_delta(1);
+            return;
+        }
+        for (int i = 0; i < LIST_ROWS; ++i) {
+            int idx = feed_settings_page * LIST_ROWS + i;
+            if (idx >= feed_count) break;
+            if (hit(z_feed_delete[i], x, y)) { delete_feed(idx); return; }
+            if (hit(z_feed_edit[i], x, y)) { edit_feed(idx); return; }
+        }
+        return;
+    }
+
+    if (view == VIEW_FEED_EDITOR) {
+        if (hit(z_back, x, y)) { go_back(); return; }
+        if (hit(z_feed_name, x, y)) { edit_feed_name(); return; }
+        if (hit(z_feed_url, x, y)) { edit_feed_url(); return; }
+        if (hit(z_feed_editor_delete, x, y)) {
+            view = VIEW_FEED_SETTINGS;
+            delete_feed(editing_feed_idx);
+            return;
+        }
+        return;
+    }
+
     // Reading view.
     if (hit(z_save, x, y)) {
         saved[sel_feed][sel_article] = !saved[sel_feed][sel_article];
@@ -900,6 +1844,18 @@ void handle_tap(int x, int y)
         cycle_body_size();
     } else if (hit(z_next_article, x, y)) {
         next_article();
+    } else {
+        for (int i = 0; i < body_link_zone_count; ++i) {
+            if (hit(z_body_links[i], x, y)) {
+                char logline[360];
+                snprintf(logline, sizeof(logline),
+                         "link-tap zone=%d x=%d y=%d url=%s", i, x, y,
+                         z_body_link_urls[i]);
+                write_diag_log(logline);
+                open_url(z_body_link_urls[i]);
+                return;
+            }
+        }
     }
 }
 
