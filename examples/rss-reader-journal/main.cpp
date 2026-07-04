@@ -430,9 +430,21 @@ void write_diag_log(const char *line)
     fclose(fp);
 }
 
+const char *diagnostic_libs[] = {
+    "libcurl.so.4", "libcurl.so", "libxml2.so.2", "libxml2.so",
+    "libssl.so.1.0.0", "libssl.so.3", "libssl.so.1.1", "libssl.so",
+    "libcrypto.so.1.0.0", "libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so",
+    "libssl3.so", "libnss3.so", "libnssutil3.so", "libsmime3.so",
+    "libnspr4.so", "libplc4.so", "libplds4.so", "libgnutls.so.30",
+    "libgnutls.so", "libmbedtls.so", "libmbedcrypto.so", "libwolfssl.so",
+    "liblzma.so.5", "libz.so.1", "libcares.so.2"
+};
+const int diagnostic_lib_count = sizeof(diagnostic_libs) / sizeof(diagnostic_libs[0]);
+
 bool probe_library(const char *name, char *out, int cap)
 {
-    void *h = dlopen(name, RTLD_LAZY);
+    dlerror();
+    void *h = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
     if (h) {
         dlclose(h);
         snprintf(out, cap, "OK   %s", name);
@@ -442,6 +454,50 @@ bool probe_library(const char *name, char *out, int cap)
     const char *err = dlerror();
     snprintf(out, cap, "MISS %s%s%s", name, err ? " — " : "", err ? err : "");
     return false;
+}
+
+void write_symbol_probe(void *handle, const char *symbol)
+{
+    char line[160];
+    dlerror();
+    void *sym = dlsym(handle, symbol);
+    const char *err = dlerror();
+    snprintf(line, sizeof(line), "%s symbol %s%s%s", sym ? "OK  " : "MISS",
+             symbol, err ? " — " : "", err ? err : "");
+    write_diag_log(line);
+}
+
+void write_curl_diagnostics()
+{
+    char line[320];
+    dlerror();
+    void *h = dlopen("libcurl.so.4", RTLD_LAZY | RTLD_LOCAL);
+    if (!h) h = dlopen("libcurl.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!h) {
+        const char *err = dlerror();
+        snprintf(line, sizeof(line), "curl-dlopen FAIL %s", err ? err : "unknown");
+        write_diag_log(line);
+        return;
+    }
+
+    write_diag_log("curl-dlopen OK");
+    write_symbol_probe(h, "curl_version");
+    write_symbol_probe(h, "curl_version_info");
+    write_symbol_probe(h, "curl_easy_init");
+    write_symbol_probe(h, "curl_easy_setopt");
+    write_symbol_probe(h, "curl_easy_perform");
+    write_symbol_probe(h, "curl_easy_cleanup");
+    write_symbol_probe(h, "curl_easy_strerror");
+
+    typedef char *(*curl_version_fn)();
+    dlerror();
+    curl_version_fn version = (curl_version_fn)dlsym(h, "curl_version");
+    if (version && !dlerror()) {
+        snprintf(line, sizeof(line), "curl-version %s", version());
+        write_diag_log(line);
+    }
+
+    dlclose(h);
 }
 
 void write_diagnostics_log()
@@ -455,15 +511,11 @@ void write_diagnostics_log()
     snprintf(line, sizeof(line), "logs: /mnt/ext1/rss-reader-journal-{keys,sync,diagnostics}.log");
     write_diag_log(line);
 
-    const char *libs[] = {
-        "libcurl.so.4", "libcurl.so", "libxml2.so.2", "libxml2.so",
-        "libssl.so.1.0.0", "libcrypto.so.1.0.0", "liblzma.so.5",
-        "libz.so.1", "libcares.so.2"
-    };
-    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
-        probe_library(libs[i], line, sizeof(line));
+    for (int i = 0; i < diagnostic_lib_count; ++i) {
+        probe_library(diagnostic_libs[i], line, sizeof(line));
         write_diag_log(line);
     }
+    write_curl_diagnostics();
 }
 
 void record_key_debug(const char *kind, int key, int extra)
@@ -807,11 +859,6 @@ void draw_diagnostics()
 {
     int w = ScreenWidth();
     char line[240];
-    const char *libs[] = {
-        "libcurl.so.4", "libcurl.so", "libxml2.so.2", "libxml2.so",
-        "libssl.so.1.0.0", "libcrypto.so.1.0.0", "liblzma.so.5",
-        "libz.so.1", "libcares.so.2"
-    };
 
     write_diagnostics_log();
     ClearScreen();
@@ -833,12 +880,16 @@ void draw_diagnostics()
          "/rss-reader-journal-sync.log", ALIGN_LEFT | VALIGN_TOP | DOTS);
     y += 68;
 
-    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
-        probe_library(libs[i], line, sizeof(line));
+    int visible = diagnostic_lib_count < 12 ? diagnostic_lib_count : 12;
+    for (int i = 0; i < visible; ++i) {
+        probe_library(diagnostic_libs[i], line, sizeof(line));
         text(f_nav, PAD, y, w - PAD * 2, 42, line,
              ALIGN_LEFT | VALIGN_TOP | DOTS);
         y += 54;
     }
+    text(f_hint_i, PAD, y + 18, w - PAD * 2, 42,
+         "Full curl/TLS symbol probes are in diagnostics.log",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
 
     FullUpdate();
 }
