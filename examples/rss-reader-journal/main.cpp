@@ -7,6 +7,9 @@
 
 #include "inkview.h"
 
+#include <curl/curl.h>
+#include <libxml/xmlreader.h>
+
 #include <ctype.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -1204,7 +1207,54 @@ void append_limited(char *dst, int cap, const char *src)
     snprintf(dst + len, cap - len, "%s", src);
 }
 
-void decode_entities(char *s);
+void append_utf8(char **w, unsigned codepoint)
+{
+    if (codepoint < 0x80) {
+        *(*w)++ = (char)codepoint;
+    } else if (codepoint < 0x800) {
+        *(*w)++ = (char)(0xC0 | (codepoint >> 6));
+        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+        *(*w)++ = (char)(0xE0 | (codepoint >> 12));
+        *(*w)++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
+    }
+}
+
+void decode_entities(char *s)
+{
+    char *r = s;
+    char *w = s;
+    while (*r) {
+        if (!strncmp(r, "&amp;", 5)) { *w++ = '&'; r += 5; }
+        else if (!strncmp(r, "&lt;", 4)) { *w++ = '<'; r += 4; }
+        else if (!strncmp(r, "&gt;", 4)) { *w++ = '>'; r += 4; }
+        else if (!strncmp(r, "&quot;", 6)) { *w++ = '"'; r += 6; }
+        else if (!strncmp(r, "&apos;", 6)) { *w++ = '\''; r += 6; }
+        else if (!strncmp(r, "&nbsp;", 6)) { *w++ = ' '; r += 6; }
+        else if (!strncmp(r, "&mdash;", 7)) { append_utf8(&w, 0x2014); r += 7; }
+        else if (!strncmp(r, "&ndash;", 7)) { append_utf8(&w, 0x2013); r += 7; }
+        else if (!strncmp(r, "&rsquo;", 7)) { append_utf8(&w, 0x2019); r += 7; }
+        else if (!strncmp(r, "&lsquo;", 7)) { append_utf8(&w, 0x2018); r += 7; }
+        else if (!strncmp(r, "&rdquo;", 7)) { append_utf8(&w, 0x201D); r += 7; }
+        else if (!strncmp(r, "&ldquo;", 7)) { append_utf8(&w, 0x201C); r += 7; }
+        else if (r[0] == '&' && r[1] == '#') {
+            char *end = 0;
+            unsigned code = 0;
+            if (r[2] == 'x' || r[2] == 'X') code = (unsigned)strtoul(r + 3, &end, 16);
+            else code = (unsigned)strtoul(r + 2, &end, 10);
+            if (end && *end == ';' && code > 0 && code < 0x10000) {
+                append_utf8(&w, code);
+                r = end + 1;
+            } else {
+                *w++ = *r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
 
 void copy_href_from_tag(const char *tag, char *out, int cap)
 {
@@ -1280,163 +1330,139 @@ void strip_markup(char *dst, int cap, const char *src)
     copy_trimmed(dst, cap, tmp);
 }
 
-bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
+struct CurlRuntime {
+    void *handle;
+    CURL *(*easy_init)();
+    CURLcode (*easy_setopt)(CURL *, CURLoption, ...);
+    CURLcode (*easy_perform)(CURL *);
+    CURLcode (*easy_getinfo)(CURL *, CURLINFO, ...);
+    void (*easy_cleanup)(CURL *);
+    const char *(*easy_strerror)(CURLcode);
+};
+
+bool load_curl(CurlRuntime *rt, char *error, int error_cap)
 {
-    int size = 0;
-    int timeout = 30000;
-    int err = 0;
-    void *data = QuickDownloadExt3(url, &size, timeout, NULL, NULL, &err);
-    if (!data || size <= 0) {
-        snprintf(error, error_cap, "download failed (%d)", err);
-        if (data) free(data);
+    memset(rt, 0, sizeof(*rt));
+    rt->handle = dlopen("libcurl.so.4", RTLD_LAZY | RTLD_LOCAL);
+    if (!rt->handle) rt->handle = dlopen("libcurl.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!rt->handle) {
+        const char *err = dlerror();
+        snprintf(error, error_cap, "libcurl missing: %s", err ? err : "unknown");
         return false;
     }
-    if (size >= cap) {
-        snprintf(error, error_cap, "feed too large");
-        free(data);
+
+    rt->easy_init = (CURL *(*)())dlsym(rt->handle, "curl_easy_init");
+    rt->easy_setopt = (CURLcode (*)(CURL *, CURLoption, ...))dlsym(rt->handle, "curl_easy_setopt");
+    rt->easy_perform = (CURLcode (*)(CURL *))dlsym(rt->handle, "curl_easy_perform");
+    rt->easy_getinfo = (CURLcode (*)(CURL *, CURLINFO, ...))dlsym(rt->handle, "curl_easy_getinfo");
+    rt->easy_cleanup = (void (*)(CURL *))dlsym(rt->handle, "curl_easy_cleanup");
+    rt->easy_strerror = (const char *(*)(CURLcode))dlsym(rt->handle, "curl_easy_strerror");
+
+    if (!rt->easy_init || !rt->easy_setopt || !rt->easy_perform ||
+        !rt->easy_getinfo || !rt->easy_cleanup || !rt->easy_strerror) {
+        snprintf(error, error_cap, "libcurl symbols missing");
+        dlclose(rt->handle);
+        memset(rt, 0, sizeof(*rt));
         return false;
     }
-    memcpy(buffer, data, size);
-    buffer[size] = 0;
-    free(data);
     return true;
 }
 
-const char *next_tag(const char *p, const char *end, const char *local_name)
+void unload_curl(CurlRuntime *rt)
 {
-    int want = (int)strlen(local_name);
-    while (p && p < end) {
-        const char *lt = (const char *)memchr(p, '<', end - p);
-        if (!lt || lt + 1 >= end) return NULL;
-        if (lt[1] == '/' || lt[1] == '!' || lt[1] == '?') { p = lt + 1; continue; }
-        const char *name = lt + 1;
-        const char *name_end = name;
-        while (name_end < end && *name_end && !isspace((unsigned char)*name_end) &&
-               *name_end != '>' && *name_end != '/') name_end++;
-        const char *local = name;
-        for (const char *q = name; q < name_end; ++q)
-            if (*q == ':') local = q + 1;
-        if (name_end - local == want && !strncmp(local, local_name, want)) return lt;
-        p = name_end;
+    if (rt->handle) dlclose(rt->handle);
+    memset(rt, 0, sizeof(*rt));
+}
+
+struct FetchBuffer {
+    char *data;
+    int len;
+    int cap;
+    bool overflow;
+};
+
+size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    FetchBuffer *buf = (FetchBuffer *)userdata;
+    int bytes = (int)(size * nmemb);
+    if (buf->len + bytes >= buf->cap) {
+        bytes = buf->cap - buf->len - 1;
+        buf->overflow = true;
     }
-    return NULL;
-}
-
-const char *tag_content_start(const char *tag, const char *end)
-{
-    const char *gt = (const char *)memchr(tag, '>', end - tag);
-    return gt ? gt + 1 : NULL;
-}
-
-const char *find_close_tag(const char *p, const char *end, const char *local_name)
-{
-    int want = (int)strlen(local_name);
-    while (p && p < end) {
-        const char *lt = (const char *)memchr(p, '<', end - p);
-        if (!lt || lt + 2 >= end) return NULL;
-        if (lt[1] != '/') { p = lt + 1; continue; }
-        const char *name = lt + 2;
-        const char *name_end = name;
-        while (name_end < end && *name_end && !isspace((unsigned char)*name_end) &&
-               *name_end != '>') name_end++;
-        const char *local = name;
-        for (const char *q = name; q < name_end; ++q)
-            if (*q == ':') local = q + 1;
-        if (name_end - local == want && !strncmp(local, local_name, want)) return lt;
-        p = name_end;
+    if (bytes > 0) {
+        memcpy(buf->data + buf->len, ptr, bytes);
+        buf->len += bytes;
+        buf->data[buf->len] = 0;
     }
-    return NULL;
+    return size * nmemb;
 }
 
-void append_utf8(char **w, unsigned codepoint)
+bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
 {
-    if (codepoint < 0x80) {
-        *(*w)++ = (char)codepoint;
-    } else if (codepoint < 0x800) {
-        *(*w)++ = (char)(0xC0 | (codepoint >> 6));
-        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
-    } else if (codepoint < 0x10000) {
-        *(*w)++ = (char)(0xE0 | (codepoint >> 12));
-        *(*w)++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
-        *(*w)++ = (char)(0x80 | (codepoint & 0x3F));
+    CurlRuntime curl;
+    if (!load_curl(&curl, error, error_cap)) return false;
+
+    CURL *easy = curl.easy_init();
+    if (!easy) {
+        snprintf(error, error_cap, "curl init failed");
+        unload_curl(&curl);
+        return false;
     }
-}
 
-void decode_entities(char *s)
-{
-    char *r = s;
-    char *w = s;
-    while (*r) {
-        if (!strncmp(r, "&amp;", 5)) { *w++ = '&'; r += 5; }
-        else if (!strncmp(r, "&lt;", 4)) { *w++ = '<'; r += 4; }
-        else if (!strncmp(r, "&gt;", 4)) { *w++ = '>'; r += 4; }
-        else if (!strncmp(r, "&quot;", 6)) { *w++ = '"'; r += 6; }
-        else if (!strncmp(r, "&apos;", 6)) { *w++ = '\''; r += 6; }
-        else if (!strncmp(r, "&nbsp;", 6)) { *w++ = ' '; r += 6; }
-        else if (!strncmp(r, "&mdash;", 7)) { append_utf8(&w, 0x2014); r += 7; }
-        else if (!strncmp(r, "&ndash;", 7)) { append_utf8(&w, 0x2013); r += 7; }
-        else if (!strncmp(r, "&rsquo;", 7)) { append_utf8(&w, 0x2019); r += 7; }
-        else if (!strncmp(r, "&lsquo;", 7)) { append_utf8(&w, 0x2018); r += 7; }
-        else if (!strncmp(r, "&rdquo;", 7)) { append_utf8(&w, 0x201D); r += 7; }
-        else if (!strncmp(r, "&ldquo;", 7)) { append_utf8(&w, 0x201C); r += 7; }
-        else if (r[0] == '&' && r[1] == '#') {
-            char *end = 0;
-            unsigned code = 0;
-            if (r[2] == 'x' || r[2] == 'X') code = (unsigned)strtoul(r + 3, &end, 16);
-            else code = (unsigned)strtoul(r + 2, &end, 10);
-            if (end && *end == ';' && code > 0 && code < 0x10000) {
-                append_utf8(&w, code);
-                r = end + 1;
-            } else {
-                *w++ = *r++;
-            }
-        } else {
-            *w++ = *r++;
-        }
+    FetchBuffer fb = {buffer, 0, cap, false};
+    buffer[0] = 0;
+    curl.easy_setopt(easy, CURLOPT_URL, url);
+    curl.easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl.easy_setopt(easy, CURLOPT_WRITEDATA, &fb);
+    curl.easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl.easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 12L);
+    curl.easy_setopt(easy, CURLOPT_TIMEOUT, 25L);
+    curl.easy_setopt(easy, CURLOPT_USERAGENT, "PocketBook RSS Reader/0.1");
+    curl.easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    CURLcode rc = curl.easy_perform(easy);
+    long status = 0;
+    curl.easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+    curl.easy_cleanup(easy);
+
+    bool ok = true;
+    if (rc != CURLE_OK) {
+        snprintf(error, error_cap, "%s", curl.easy_strerror(rc));
+        ok = false;
+    } else if (status >= 400) {
+        snprintf(error, error_cap, "HTTP %ld", status);
+        ok = false;
+    } else if (fb.overflow) {
+        snprintf(error, error_cap, "feed too large");
+        ok = false;
+    } else if (fb.len <= 0) {
+        snprintf(error, error_cap, "empty response");
+        ok = false;
     }
-    *w = 0;
+
+    unload_curl(&curl);
+    return ok;
 }
 
-void copy_tag_text(const char *start, const char *end, const char *name,
-                   char *out, int cap)
+int field_for_name(const char *name)
 {
-    out[0] = 0;
-    const char *tag = next_tag(start, end, name);
-    if (!tag) return;
-    const char *content = tag_content_start(tag, end);
-    if (!content) return;
-    const char *close = find_close_tag(content, end, name);
-    if (!close) return;
-    int n = close - content;
-    if (n >= cap) n = cap - 1;
-    memcpy(out, content, n);
-    out[n] = 0;
-    decode_entities(out);
-    copy_trimmed(out, cap, out);
+    if (!strcmp(name, "title")) return 1;
+    if (!strcmp(name, "link")) return 2;
+    if (!strcmp(name, "pubDate") || !strcmp(name, "updated") ||
+        !strcmp(name, "published")) return 3;
+    if (!strcmp(name, "description") || !strcmp(name, "summary") ||
+        !strcmp(name, "content") || !strcmp(name, "encoded")) return 4;
+    return 0;
 }
 
-void copy_atom_href(const char *start, const char *end, char *out, int cap)
+void append_field(char *dst, int cap, const char *text)
 {
-    const char *tag = start;
-    while ((tag = next_tag(tag, end, "link"))) {
-        const char *gt = (const char *)memchr(tag, '>', end - tag);
-        if (!gt) return;
-        const char *href = strstr(tag, "href=");
-        if (href && href < gt) {
-            href += 5;
-            char quote = (*href == '\'' || *href == '"') ? *href++ : ' ';
-            const char *stop = href;
-            while (stop < gt && ((quote == ' ' && !isspace((unsigned char)*stop) && *stop != '>') ||
-                                 (quote != ' ' && *stop != quote))) stop++;
-            int n = stop - href;
-            if (n >= cap) n = cap - 1;
-            memcpy(out, href, n);
-            out[n] = 0;
-            decode_entities(out);
-            return;
-        }
-        tag = gt + 1;
-    }
+    if (!text || !*text) return;
+    int len = (int)strlen(dst);
+    if (len + 1 >= cap) return;
+    snprintf(dst + len, cap - len, "%s", text);
 }
 
 void commit_feed_item(FeedArticleStore &store, int *count,
@@ -1447,7 +1473,8 @@ void commit_feed_item(FeedArticleStore &store, int *count,
     copy_trimmed(store.titles[idx], TITLE_BUF, *title ? title : "Untitled article");
     copy_trimmed(store.metas[idx], META_BUF, *date ? date : "Fetched just now");
     strip_markup(store.bodies[idx], BODY_BUF, *desc ? desc : link);
-    if (!store.bodies[idx][0]) copy_trimmed(store.bodies[idx], BODY_BUF, "No summary was provided by this feed.");
+    if (!store.bodies[idx][0])
+        copy_trimmed(store.bodies[idx], BODY_BUF, "No summary was provided by this feed.");
     if (*link && (int)strlen(store.bodies[idx]) < BODY_BUF - 16) {
         append_limited(store.bodies[idx], BODY_BUF, "\n\xE2\x86\x97 ");
         append_limited(store.bodies[idx], BODY_BUF, link);
@@ -1456,44 +1483,63 @@ void commit_feed_item(FeedArticleStore &store, int *count,
                                     store.bodies[idx]};
 }
 
-int parse_feed_items(int feed_idx, const char *xml, int len, const char *item_name)
-{
-    FeedArticleStore &store = fetched_feed_store[feed_idx];
-    const char *end = xml + len;
-    const char *p = xml;
-    int count = 0;
-    while (count < MAX_FEED_ARTICLES) {
-        const char *tag = next_tag(p, end, item_name);
-        if (!tag) break;
-        const char *content = tag_content_start(tag, end);
-        if (!content) break;
-        const char *close = find_close_tag(content, end, item_name);
-        if (!close) break;
-
-        char title[TITLE_BUF] = "";
-        char link[256] = "";
-        char date[META_BUF] = "";
-        char desc[BODY_BUF] = "";
-        copy_tag_text(content, close, "title", title, sizeof(title));
-        copy_tag_text(content, close, "link", link, sizeof(link));
-        if (!link[0]) copy_atom_href(content, close, link, sizeof(link));
-        copy_tag_text(content, close, "pubDate", date, sizeof(date));
-        if (!date[0]) copy_tag_text(content, close, "updated", date, sizeof(date));
-        if (!date[0]) copy_tag_text(content, close, "published", date, sizeof(date));
-        copy_tag_text(content, close, "encoded", desc, sizeof(desc));
-        if (!desc[0]) copy_tag_text(content, close, "content", desc, sizeof(desc));
-        if (!desc[0]) copy_tag_text(content, close, "description", desc, sizeof(desc));
-        if (!desc[0]) copy_tag_text(content, close, "summary", desc, sizeof(desc));
-        commit_feed_item(store, &count, title, link, date, desc);
-        p = close + 1;
-    }
-    return count;
-}
-
 int parse_feed_xml(int feed_idx, const char *xml, int len)
 {
-    int count = parse_feed_items(feed_idx, xml, len, "item");
-    if (count == 0) count = parse_feed_items(feed_idx, xml, len, "entry");
+    FeedArticleStore &store = fetched_feed_store[feed_idx];
+    xmlTextReaderPtr reader = xmlReaderForMemory(xml, len, feeds[feed_idx].url,
+                                                 NULL, XML_PARSE_RECOVER | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    if (!reader) return 0;
+
+    bool in_item = false;
+    int current_field = 0;
+    int field_depth = 0;
+    int count = 0;
+    char title[TITLE_BUF] = "";
+    char link[256] = "";
+    char date[META_BUF] = "";
+    char desc[BODY_BUF] = "";
+
+    while (count < MAX_FEED_ARTICLES && xmlTextReaderRead(reader) == 1) {
+        int type = xmlTextReaderNodeType(reader);
+        int depth = xmlTextReaderDepth(reader);
+        const xmlChar *local = xmlTextReaderConstLocalName(reader);
+        const char *name = local ? (const char *)local : "";
+
+        if (type == XML_READER_TYPE_ELEMENT) {
+            if (!strcmp(name, "item") || !strcmp(name, "entry")) {
+                in_item = true;
+                current_field = 0;
+                title[0] = link[0] = date[0] = desc[0] = 0;
+            } else if (in_item) {
+                if (!strcmp(name, "link")) {
+                    xmlChar *href = xmlTextReaderGetAttribute(reader, (const xmlChar *)"href");
+                    if (href && !link[0]) copy_trimmed(link, sizeof(link), (const char *)href);
+                    if (href) xmlFree(href);
+                }
+                current_field = field_for_name(name);
+                if (current_field) field_depth = depth;
+            }
+        } else if ((type == XML_READER_TYPE_TEXT || type == XML_READER_TYPE_CDATA ||
+                    type == XML_READER_TYPE_SIGNIFICANT_WHITESPACE) && in_item && current_field) {
+            const xmlChar *value = xmlTextReaderConstValue(reader);
+            if (value) {
+                if (current_field == 1) append_field(title, sizeof(title), (const char *)value);
+                else if (current_field == 2) append_field(link, sizeof(link), (const char *)value);
+                else if (current_field == 3) append_field(date, sizeof(date), (const char *)value);
+                else if (current_field == 4) append_field(desc, sizeof(desc), (const char *)value);
+            }
+        } else if (type == XML_READER_TYPE_END_ELEMENT) {
+            if (in_item && (!strcmp(name, "item") || !strcmp(name, "entry"))) {
+                commit_feed_item(store, &count, title, link, date, desc);
+                in_item = false;
+                current_field = 0;
+            } else if (current_field && depth <= field_depth) {
+                current_field = 0;
+            }
+        }
+    }
+
+    xmlFreeTextReader(reader);
     return count;
 }
 
@@ -2005,6 +2051,7 @@ int main_handler(int event_type, int param_one, int param_two)
         // panel size, so bottom-anchored footers would render inside the
         // panel strip. The design is chrome-free anyway: disable it.
         SetPanelType(PANEL_DISABLED);
+        xmlInitParser();
         memset(saved, 0, sizeof(saved));
         open_fonts();
         refresh_date();
@@ -2027,6 +2074,7 @@ int main_handler(int event_type, int param_one, int param_two)
         draw_debug_overlay();
     } else if (event_type == EVT_EXIT) {
         close_fonts();
+        xmlCleanupParser();
     }
 
     return 0;
