@@ -561,18 +561,29 @@ void draw_feeds()
     text(f_meta_i, PAD, 158, w - PAD * 2 - 320, 36, buf,
          ALIGN_LEFT | VALIGN_TOP | DOTS);
 
-    // Sync now / Settings, right-aligned above the masthead rule.
+    // Sync now / Settings, horizontally aligned and right-aligned.
     int right = w - PAD;
+    const int icon_w = 34;
+    const int icon_gap = 14;
+    const int button_gap = 48;
+    const int button_y = 146;
+    const int button_cy = button_y + 22;
     SetFont(f_i32, C_BLACK);
     int sw = StringWidth((char *)"Sync now");
     int gw = StringWidth((char *)"Settings");
-    text(f_i32, right - sw, 86, sw, 44, "Sync now", ALIGN_LEFT | VALIGN_MIDDLE);
-    draw_sync(right - sw - 14 - 20, 108, 17);
-    text(f_i32, right - gw, 146, gw, 44, "Settings", ALIGN_LEFT | VALIGN_MIDDLE);
-    draw_gear(right - gw - 14 - 20, 168, 17);
-    int zx = right - ((sw > gw ? sw : gw) + 34 + 40);
-    z_sync = (Zone){zx, 70, right - zx + 20, 76};
-    z_settings = (Zone){zx, 146, right - zx + 20, 76};
+    int sync_w = icon_w + icon_gap + sw;
+    int settings_w = icon_w + icon_gap + gw;
+    int settings_x = right - settings_w;
+    int sync_x = settings_x - button_gap - sync_w;
+
+    draw_sync(sync_x + icon_w / 2, button_cy, 17);
+    text(f_i32, sync_x + icon_w + icon_gap, button_y, sw, 44,
+         "Sync now", ALIGN_LEFT | VALIGN_MIDDLE);
+    draw_gear(settings_x + icon_w / 2, button_cy, 17);
+    text(f_i32, settings_x + icon_w + icon_gap, button_y, gw, 44,
+         "Settings", ALIGN_LEFT | VALIGN_MIDDLE);
+    z_sync = (Zone){sync_x - 10, button_y - 16, sync_w + 20, 76};
+    z_settings = (Zone){settings_x - 10, button_y - 16, settings_w + 20, 76};
 
     rule(PAD, 222, w - PAD * 2, 6);
 
