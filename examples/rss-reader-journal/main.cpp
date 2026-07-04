@@ -30,6 +30,9 @@ const int PB_KEY_PREV = 0x18;
 const int PB_KEY_NEXT = 0x19;
 const int PB_KEY_HOME = 0x1a;
 const int PB_KEY_BACK = 0x1b;
+const int PB_KEY_PREV2 = 0x1c;
+const int PB_KEY_NEXT2 = 0x1d;
+const int PB_KEY_BACK_EVDEV = 158;
 
 // Layout constants from the design doc (1264 x 1680 canvas).
 const int PAD = 72;            // page margin on list screens
@@ -284,6 +287,8 @@ bool hit(const Zone &z, int x, int y)
 }
 Zone z_sync, z_settings, z_back;
 Zone z_save, z_aa, z_next_article;
+int release_already_handled = 0;
+char debug_key_line[160] = "key debug: waiting for keypress";
 
 // -------------------------------------------------------------- helpers ---
 
@@ -337,6 +342,45 @@ void text(ifont *font, int x, int y, int w, int h, const char *value, int flags)
 void rule(int x, int y, int w, int thickness)
 {
     FillArea(x, y, w, thickness, C_BLACK);
+}
+
+const char *view_name()
+{
+    if (view == VIEW_FEEDS) return "feeds";
+    if (view == VIEW_ARTICLES) return "articles";
+    return "reading";
+}
+
+void write_key_log(const char *kind, int key, int extra)
+{
+    FILE *fp = fopen("/mnt/ext1/rss-reader-journal-keys.log", "a");
+    if (!fp) fp = fopen("/tmp/rss-reader-journal-keys.log", "a");
+    if (!fp) return;
+
+    fprintf(fp, "%s key=%d hex=0x%x extra=%d view=%s feed=%d article=%d read_page=%d\n",
+            kind, key, key, extra, view_name(), sel_feed, sel_article, read_page);
+    fclose(fp);
+}
+
+void record_key_debug(const char *kind, int key, int extra)
+{
+    snprintf(debug_key_line, sizeof(debug_key_line),
+             "%s key=%d hex=0x%x extra=%d view=%s",
+             kind, key, key, extra, view_name());
+    write_key_log(kind, key, extra);
+}
+
+void draw_debug_overlay()
+{
+    int w = ScreenWidth();
+    int h = ScreenHeight();
+    int y = h - 48;
+
+    FillArea(0, y, w, 48, C_WHITE);
+    rule(0, y, w, 2);
+    text(f_hint_i, 12, y + 8, w - 24, 34, debug_key_line,
+         ALIGN_LEFT | VALIGN_MIDDLE | DOTS);
+    PartialUpdateBW(0, y, w, 48);
 }
 
 // ------------------------------------------------------- geometric icons ---
@@ -706,6 +750,19 @@ void next_article()
     }
 }
 
+void previous_article_or_list()
+{
+    if (sel_article > 0) {
+        open_article(sel_feed, sel_article - 1);
+        read_page = read_pages - 1;
+        draw_screen();
+    } else {
+        view = VIEW_ARTICLES;
+        art_page = sel_article / LIST_ROWS;
+        draw_screen();
+    }
+}
+
 void do_sync()
 {
     time_t t = time(0);
@@ -733,10 +790,21 @@ void page_delta(int d)
 {
     if (view == VIEW_FEEDS) {
         int next = feed_page + d;
-        if (next >= 0 && next < feed_pages()) { feed_page = next; draw_screen(); }
+        if (next >= 0 && next < feed_pages()) {
+            feed_page = next;
+            draw_screen();
+        } else if (d < 0) {
+            CloseApp();
+        }
     } else if (view == VIEW_ARTICLES) {
         int next = art_page + d;
-        if (next >= 0 && next < article_pages()) { art_page = next; draw_screen(); }
+        if (next >= 0 && next < article_pages()) {
+            art_page = next;
+            draw_screen();
+        } else if (d < 0) {
+            view = VIEW_FEEDS;
+            draw_screen();
+        }
     } else {
         int next = read_page + d;
         if (next >= 0 && next < read_pages) {
@@ -744,6 +812,8 @@ void page_delta(int d)
             draw_screen();
         } else if (d > 0) {
             next_article();
+        } else {
+            previous_article_or_list();
         }
     }
 }
@@ -822,19 +892,91 @@ void handle_tap(int x, int y)
     }
 }
 
+bool is_back_key(int key)
+{
+    return key == PB_KEY_BACK || key == PB_KEY_BACK_EVDEV;
+}
+
+bool is_prev_key(int key)
+{
+    return key == PB_KEY_PREV || key == PB_KEY_PREV2 ||
+           key == PB_KEY_LEFT || key == PB_KEY_UP;
+}
+
+bool is_next_key(int key)
+{
+    return key == PB_KEY_NEXT || key == PB_KEY_NEXT2 ||
+           key == PB_KEY_RIGHT || key == PB_KEY_DOWN || key == PB_KEY_OK;
+}
+
+bool is_handled_key(int key)
+{
+    return is_back_key(key) || key == PB_KEY_HOME ||
+           is_prev_key(key) || is_next_key(key);
+}
+
+bool has_same_key_action(int a, int b)
+{
+    return a == b || (is_back_key(a) && is_back_key(b)) ||
+           (is_prev_key(a) && is_prev_key(b)) ||
+           (is_next_key(a) && is_next_key(b));
+}
+
+void go_home()
+{
+    view = VIEW_FEEDS;
+    draw_screen();
+}
+
 void handle_key(int key)
 {
-    if (key == PB_KEY_BACK) {
+    View before_view = view;
+    int before_feed_page = feed_page;
+    int before_art_page = art_page;
+    int before_read_page = read_page;
+    int before_sel_feed = sel_feed;
+    int before_sel_article = sel_article;
+    const char *action = "ignored";
+
+    if (is_back_key(key)) {
+        action = "BACK";
         go_back();
     } else if (key == PB_KEY_HOME) {
-        view = VIEW_FEEDS;
-        draw_screen();
-    } else if (key == PB_KEY_PREV || key == PB_KEY_LEFT || key == PB_KEY_UP) {
+        action = "HOME";
+        go_home();
+    } else if (is_prev_key(key)) {
+        action = "PREV";
         page_delta(-1);
-    } else if (key == PB_KEY_NEXT || key == PB_KEY_RIGHT ||
-               key == PB_KEY_DOWN || key == PB_KEY_OK) {
+    } else if (is_next_key(key)) {
+        action = "NEXT";
         page_delta(1);
     }
+
+    bool changed = before_view != view || before_feed_page != feed_page ||
+                   before_art_page != art_page || before_read_page != read_page ||
+                   before_sel_feed != sel_feed || before_sel_article != sel_article;
+    snprintf(debug_key_line, sizeof(debug_key_line),
+             "%s key=%d 0x%x %s view=%s f=%d/%d a=%d/%d r=%d/%d",
+             action, key, key, changed ? "changed" : "no-op", view_name(),
+             feed_page + 1, feed_pages(), art_page + 1, article_pages(),
+             read_page + 1, read_pages);
+    write_key_log(debug_key_line, key, changed ? 1 : 0);
+}
+
+void handle_key_press(int key)
+{
+    release_already_handled = is_handled_key(key) ? key : 0;
+    handle_key(key);
+}
+
+void handle_key_release(int key)
+{
+    if (has_same_key_action(key, release_already_handled)) {
+        release_already_handled = 0;
+        return;
+    }
+
+    handle_key(key);
 }
 
 int main_handler(int event_type, int param_one, int param_two)
@@ -854,7 +996,17 @@ int main_handler(int event_type, int param_one, int param_two)
     } else if (event_type == EVT_POINTERUP || event_type == EVT_TOUCHUP) {
         handle_tap(param_one, param_two);
     } else if (event_type == EVT_KEYPRESS) {
+        record_key_debug("KEYPRESS", param_one, param_two);
+        handle_key_press(param_one);
+        draw_debug_overlay();
+    } else if (event_type == EVT_KEYRELEASE) {
+        record_key_debug("KEYRELEASE", param_one, param_two);
+        handle_key_release(param_one);
+        draw_debug_overlay();
+    } else if (event_type == EVT_KEYREPEAT) {
+        record_key_debug("KEYREPEAT", param_one, param_two);
         handle_key(param_one);
+        draw_debug_overlay();
     } else if (event_type == EVT_EXIT) {
         close_fonts();
     }
