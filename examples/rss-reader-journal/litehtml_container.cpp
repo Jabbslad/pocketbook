@@ -5,6 +5,14 @@
 #include "inkview.h"
 #include "litehtml_container.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#define STBI_NO_PSD
+#define STBI_NO_PIC
+#define STBI_NO_PNM
+#include "stb_image.h"
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,21 +159,50 @@ void PbHtmlContainer::load_image(const char *src, const char * /*baseurl*/,
     ibitmap *bmp = NULL;
     char path[512];
     if (m_resolver(src, path, sizeof(path))) {
-        unsigned char magic[8];
-        memset(magic, 0, sizeof(magic));
-        FILE *fp = fopen(path, "rb");
-        if (fp) {
-            if (fread(magic, 1, sizeof(magic), fp) < 4) memset(magic, 0, 8);
-            fclose(fp);
+        // Decode with stb_image (handles progressive JPEG, PNG, GIF, BMP
+        // deterministically — InkView's LoadJPEG rendered black rectangles
+        // for progressive JPEGs) and box-filter to the content column as
+        // an 8-bit grayscale ibitmap.
+        int sw = 0, sh = 0, comp = 0;
+        unsigned char *gray = stbi_load(path, &sw, &sh, &comp, 1);
+        if (gray && sw > 0 && sh > 0) {
+            int dw = sw > m_width ? m_width : sw;
+            int dh = (int)((long long)sh * dw / sw);
+            if (dh < 1) dh = 1;
+            int max_h = m_view_height * 2;
+            if (dh > max_h) {
+                dw = (int)((long long)dw * max_h / dh);
+                if (dw < 1) dw = 1;
+                dh = max_h;
+            }
+
+            int scanline = (dw + 3) & ~3;
+            bmp = (ibitmap *)malloc(sizeof(ibitmap) + (size_t)scanline * dh);
+            if (bmp) {
+                bmp->width = (unsigned short)dw;
+                bmp->height = (unsigned short)dh;
+                bmp->depth = 8;
+                bmp->scanline = (unsigned short)scanline;
+                // Area-average downscale for photo quality on e-ink.
+                for (int y = 0; y < dh; ++y) {
+                    int sy0 = (int)((long long)y * sh / dh);
+                    int sy1 = (int)((long long)(y + 1) * sh / dh);
+                    if (sy1 <= sy0) sy1 = sy0 + 1;
+                    for (int x = 0; x < dw; ++x) {
+                        int sx0 = (int)((long long)x * sw / dw);
+                        int sx1 = (int)((long long)(x + 1) * sw / dw);
+                        if (sx1 <= sx0) sx1 = sx0 + 1;
+                        long sum = 0;
+                        for (int yy = sy0; yy < sy1; ++yy)
+                            for (int xx = sx0; xx < sx1; ++xx)
+                                sum += gray[(size_t)yy * sw + xx];
+                        bmp->data[(size_t)y * scanline + x] =
+                            (unsigned char)(sum / ((sy1 - sy0) * (sx1 - sx0)));
+                    }
+                }
+            }
         }
-        // Decode scaled to the content box: e-ink has no use for larger.
-        int max_h = m_view_height;
-        if (magic[0] == 0xFF && magic[1] == 0xD8)
-            bmp = LoadJPEG(path, m_width, max_h, 0, 0, 1);
-        else if (magic[0] == 0x89 && magic[1] == 'P')
-            bmp = LoadPNGStretch(path, m_width, max_h, 1, 1);
-        else
-            bmp = LoadBitmap(path);
+        if (gray) stbi_image_free(gray);
     }
     m_images[key] = bmp;  // NULL too: negative-cache failed loads
 }

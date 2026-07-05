@@ -1398,7 +1398,11 @@ const char *LIT_USER_CSS =
     "blockquote{margin:16px 0 16px 24px;padding-left:24px;"
     "border-left:6px solid #888}"
     "iframe,video,svg,script,style{display:none}"
-    "img{margin:12px 0}"
+    // Feeds ship explicit width/height attributes (often full resolution);
+    // force them back to auto so litehtml's max-width path scales images
+    // to the column while preserving the aspect ratio.
+    "img{margin:12px 0;width:auto!important;height:auto!important;"
+    "max-width:100%!important}"
     "hr{border:none;border-top:2px solid #000;margin:24px 0}";
 
 bool resolve_article_image(const char *src, char *path_out, int path_cap);
