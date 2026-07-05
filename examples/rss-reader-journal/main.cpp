@@ -332,6 +332,11 @@ int art_scroll = 0, art_max_scroll = 0;
 // text only after a tap; scrolling or page turns hide it again.
 bool reading_footer_visible = false;
 
+// Thin progress bar at the very top of the screen while scrolling an
+// article; cleared when the reader taps or navigates.
+bool reading_bar_visible = false;
+const int READ_BAR_H = 10;
+
 // Scrollable reading mode (Settings > Article view).
 bool scroll_mode = false;
 int read_scroll = 0;       // pixel offset into the article content
@@ -1389,10 +1394,10 @@ void draw_reading_scrolled()
 
     z_save = z_aa = z_next_article = (Zone){0, 0, 0, 0};
 
-    // Drag frames only repaint the scrolled content region and push it
-    // with the fast DU waveform.
+    // Drag frames repaint the content plus the top progress-bar strip
+    // and push everything with the fast DU waveform.
     bool content_only = drag_frame_hint;
-    if (content_only) FillArea(0, top, w, h - top, C_WHITE);
+    if (content_only) FillArea(0, 0, w, h, C_WHITE);
     else ClearScreen();
 
     int th = read_title_h;
@@ -1451,8 +1456,16 @@ void draw_reading_scrolled()
     }
     SetClip(0, 0, w, h);
 
+    if (reading_bar_visible) {
+        FillArea(0, 0, w, READ_BAR_H, C_RULE);
+        long done = total <= avail ? total : (long)read_scroll + avail;
+        int fill_w = (int)((long long)w * done / (total > 0 ? total : 1));
+        if (fill_w > w) fill_w = w;
+        if (fill_w > 0) FillArea(0, 0, fill_w, READ_BAR_H, C_BLACK);
+    }
+
     if (content_only) {
-        DynamicUpdateBW(0, top, w, h - top);
+        DynamicUpdateBW(0, 0, w, h);
         return;
     }
 
@@ -1551,6 +1564,7 @@ void open_article(int fi, int ai)
     read_page = 0;
     read_scroll = 0;
     reading_footer_visible = false;
+    reading_bar_visible = false;
     view = VIEW_READING;
     paginate_article();
 }
@@ -3058,6 +3072,7 @@ void handle_tap(int x, int y)
             }
         }
         reading_footer_visible = !reading_footer_visible;
+        reading_bar_visible = false;
         fast_update_hint = true;
         draw_screen();
         fast_update_hint = false;
@@ -3267,8 +3282,10 @@ int main_handler(int event_type, int param_one, int param_two)
         int max_scroll;
         int *target = drag_scroll_target(&max_scroll);
         if (target) {
-            if (!drag_active && view == VIEW_READING)
+            if (!drag_active && view == VIEW_READING) {
                 reading_footer_visible = false;  // scrolling hides the footer
+                reading_bar_visible = true;      // ...and shows the progress bar
+            }
             drag_active = true;
             int pos = drag_start_scroll + (drag_start_y - param_two);
             if (pos < 0) pos = 0;
