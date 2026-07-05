@@ -13,4 +13,4 @@ include_directories("${CMAKE_FIND_ROOT_PATH}/usr/include/libxml2")
 
 add_executable(rss-reader-journal main.cpp)
 set_target_properties(rss-reader-journal PROPERTIES OUTPUT_NAME "rss-reader-journal.app")
-target_link_libraries(rss-reader-journal inkview xml2 z lzma dl m)
+target_link_libraries(rss-reader-journal inkview xml2 z lzma sqlite3 dl m)

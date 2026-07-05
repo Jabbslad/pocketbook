@@ -9,9 +9,11 @@
 
 #include <curl/curl.h>
 #include <libxml/xmlreader.h>
+#include <sqlite3.h>
 
 #include <ctype.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -440,7 +442,8 @@ const char *diagnostic_libs[] = {
     "libssl3.so", "libnss3.so", "libnssutil3.so", "libsmime3.so",
     "libnspr4.so", "libplc4.so", "libplds4.so", "libgnutls.so.30",
     "libgnutls.so", "libmbedtls.so", "libmbedcrypto.so", "libwolfssl.so",
-    "liblzma.so.5", "libz.so.1", "libcares.so.2"
+    "liblzma.so.5", "libz.so.1", "libcares.so.2",
+    "libsqlite3.so.0", "libsqlite3.so"
 };
 const int diagnostic_lib_count = sizeof(diagnostic_libs) / sizeof(diagnostic_libs[0]);
 
@@ -503,6 +506,8 @@ void write_curl_diagnostics()
     dlclose(h);
 }
 
+void write_network_diagnostics();
+
 void write_diagnostics_log()
 {
     char line[240];
@@ -519,6 +524,9 @@ void write_diagnostics_log()
         write_diag_log(line);
     }
     write_curl_diagnostics();
+    write_network_diagnostics();
+    snprintf(line, sizeof(line), "sqlite linked version %s", sqlite3_libversion());
+    write_diag_log(line);
 }
 
 void record_key_debug(const char *kind, int key, int extra)
@@ -638,6 +646,8 @@ void draw_sync(int cx, int cy, int R)
 
 // ------------------------------------------------- reading pagination ---
 
+bool is_link_paragraph(const char *text, char *url, int cap);
+
 void paginate_article()
 {
     const Feed &f = feeds[sel_feed];
@@ -664,12 +674,16 @@ void paginate_article()
 
     int footer_top = h - READ_FOOTER_H - 3;
     SetFont(f_body, C_BLACK);
+    int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
 
     int page = 0, cur = 0;
     page_start[0] = 0;
     for (int i = 0; i < para_count; ++i) {
         int avail = footer_top - (page == 0 ? read_body_top : PAD);
-        int ph = TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+        char lurl[256];
+        int ph = is_link_paragraph(paras[i], lurl, sizeof(lurl))
+                     ? line_h
+                     : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
         int need = (cur > 0 ? PARA_GAP : 0) + ph;
         if (cur > 0 && cur + need > avail && page + 1 < MAX_PAGES) {
             page++;
@@ -1076,20 +1090,25 @@ void draw_reading()
 
     body_link_zone_count = 0;
     SetFont(f_body, C_BLACK);
+    int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
     for (int i = page_start[read_page]; i < page_start[read_page + 1]; ++i) {
-        int ph = TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
         char url[256];
         bool is_link = is_link_paragraph(paras[i], url, sizeof(url));
-        DrawTextRect(READ_PAD, y, cw, ph, (char *)paras[i],
-                     ALIGN_LEFT | VALIGN_TOP);
         if (is_link) {
+            DrawTextRect(READ_PAD, y, cw, line_h, (char *)paras[i],
+                         ALIGN_LEFT | VALIGN_TOP | DOTS);
             int underline_w = StringWidth((char *)paras[i]);
             if (underline_w > cw) underline_w = cw;
-            DrawLine(READ_PAD, y + ph + 4, READ_PAD + underline_w, y + ph + 4,
-                     C_BLACK);
-            add_body_link_zone(READ_PAD - 8, y - 12, underline_w + 16, ph + 28, url);
+            FillArea(READ_PAD, y + line_h + 2, underline_w, 2, C_BLACK);
+            add_body_link_zone(READ_PAD - 8, y - 8, underline_w + 16,
+                               line_h + 20, url);
+            y += line_h + PARA_GAP;
+        } else {
+            int ph = TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+            DrawTextRect(READ_PAD, y, cw, ph, (char *)paras[i],
+                         ALIGN_LEFT | VALIGN_TOP);
+            y += ph + PARA_GAP;
         }
-        y += ph + PARA_GAP;
     }
 
     // Footer bar: Save | Aa | Page n of m | Next article ›
@@ -1397,26 +1416,39 @@ size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     return size * nmemb;
 }
 
-bool fetch_url_with_quickdownload(const char *url, char *buffer, int cap,
-                                  char *error, int error_cap)
+bool get_device_dns_servers(char *out, int cap)
 {
-    int size = 0;
-    int err = 0;
-    void *data = QuickDownloadExt3(url, &size, 30000, NULL, NULL, &err);
-    if (!data || size <= 0) {
-        snprintf(error, error_cap, "QuickDownload failed (%d)", err);
-        if (data) free(data);
-        return false;
+    out[0] = 0;
+    network_interface_array *dns = GetNetDNS();
+    if (!dns) return false;
+
+    for (unsigned i = 0; i < dns->count; ++i) {
+        if (!dns->net_int[i].addr[0]) continue;
+        if (out[0]) append_limited(out, cap, ",");
+        append_limited(out, cap, dns->net_int[i].addr);
     }
-    if (size >= cap) {
-        snprintf(error, error_cap, "feed too large");
-        free(data);
-        return false;
+    free(dns);
+    return out[0] != 0;
+}
+
+void write_network_diagnostics()
+{
+    char line[240];
+    snprintf(line, sizeof(line), "network state=%d signal=%d", GetNetState(), GetNetSignalQuality());
+    write_diag_log(line);
+
+    network_interface_array *dns = GetNetDNS();
+    if (!dns) {
+        write_diag_log("dns GetNetDNS=NULL");
+        return;
     }
-    memcpy(buffer, data, size);
-    buffer[size] = 0;
-    free(data);
-    return true;
+    snprintf(line, sizeof(line), "dns count=%u", dns->count);
+    write_diag_log(line);
+    for (unsigned i = 0; i < dns->count; ++i) {
+        snprintf(line, sizeof(line), "dns[%u]=%s", i, dns->net_int[i].addr);
+        write_diag_log(line);
+    }
+    free(dns);
 }
 
 bool fetch_url_with_curl(const char *url, char *buffer, int cap,
@@ -1433,6 +1465,13 @@ bool fetch_url_with_curl(const char *url, char *buffer, int cap,
     }
 
     FetchBuffer fb = {buffer, 0, cap, false};
+    char dns_servers[128];
+    bool has_dns = get_device_dns_servers(dns_servers, sizeof(dns_servers));
+    char logline[360];
+    snprintf(logline, sizeof(logline), "FETCH curl DNS %s url=%s",
+             has_dns ? dns_servers : "<none>", url);
+    write_sync_log(logline);
+
     buffer[0] = 0;
     curl.easy_setopt(easy, CURLOPT_URL, url);
     curl.easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
@@ -1444,6 +1483,7 @@ bool fetch_url_with_curl(const char *url, char *buffer, int cap,
     curl.easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
     curl.easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
     curl.easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (has_dns) curl.easy_setopt(easy, CURLOPT_DNS_SERVERS, dns_servers);
 
     CURLcode rc = curl.easy_perform(easy);
     long status = 0;
@@ -1471,28 +1511,15 @@ bool fetch_url_with_curl(const char *url, char *buffer, int cap,
 
 bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
 {
-    char curl_error[96] = "";
     char logline[360];
-    if (fetch_url_with_curl(url, buffer, cap, curl_error, sizeof(curl_error))) {
+    if (fetch_url_with_curl(url, buffer, cap, error, error_cap)) {
         snprintf(logline, sizeof(logline), "FETCH curl OK url=%s", url);
         write_sync_log(logline);
         return true;
     }
 
-    snprintf(logline, sizeof(logline), "FETCH curl FAIL error=%s url=%s",
-             curl_error, url);
+    snprintf(logline, sizeof(logline), "FETCH curl FAIL error=%s url=%s", error, url);
     write_sync_log(logline);
-
-    if (fetch_url_with_quickdownload(url, buffer, cap, error, error_cap)) {
-        snprintf(logline, sizeof(logline), "FETCH quickdownload OK url=%s", url);
-        write_sync_log(logline);
-        return true;
-    }
-
-    snprintf(logline, sizeof(logline), "FETCH quickdownload FAIL error=%s url=%s",
-             error, url);
-    write_sync_log(logline);
-    snprintf(error, error_cap, "curl: %s; native: %s", curl_error, error);
     return false;
 }
 
@@ -1597,20 +1624,256 @@ bool refresh_one_feed(int idx, char *scratch, char *error, int error_cap)
 {
     if (!fetch_url(feeds[idx].url, scratch, MAX_FEED_BYTES, error, error_cap))
         return false;
+
+    // Remember read/saved state of the current articles by title so a
+    // re-sync does not mark already-read articles unread again.
+    static char old_titles[MAX_FEED_ARTICLES][TITLE_BUF];
+    static bool old_unread[MAX_FEED_ARTICLES];
+    static bool old_saved[MAX_FEED_ARTICLES];
+    int old_count = feeds[idx].count;
+    if (old_count > MAX_FEED_ARTICLES) old_count = MAX_FEED_ARTICLES;
+    for (int j = 0; j < old_count; ++j) {
+        snprintf(old_titles[j], TITLE_BUF, "%s", feeds[idx].articles[j].title);
+        old_unread[j] = feeds[idx].articles[j].unread;
+        old_saved[j] = saved[idx][j];
+    }
+
     int parsed = parse_feed_xml(idx, scratch, (int)strlen(scratch));
     if (parsed <= 0) {
         snprintf(error, error_cap, "no articles parsed");
         return false;
     }
-    feeds[idx].articles = fetched_feed_store[idx].articles;
-    feeds[idx].count = parsed;
+
+    Article *arts = fetched_feed_store[idx].articles;
     memset(saved[idx], 0, sizeof(saved[idx]));
+    for (int j = 0; j < parsed; ++j) {
+        for (int k = 0; k < old_count; ++k) {
+            if (!strcmp(arts[j].title, old_titles[k])) {
+                arts[j].unread = old_unread[k];
+                saved[idx][j] = old_saved[k];
+                break;
+            }
+        }
+    }
+
+    feeds[idx].articles = arts;
+    feeds[idx].count = parsed;
     return true;
 }
 
 
+// ---------------------------------------------------- state persistence ---
+// Feeds, articles and read/saved flags live in a SQLite database on flash.
+
+const char *STATE_DB_PATH = "/mnt/ext1/system/config/rss-reader-journal.db";
+const char *STATE_DB_FALLBACK = "/mnt/ext1/rss-reader-journal.db";
+
+void diag_sqlite(const char *what, sqlite3 *db)
+{
+    char line[300];
+    snprintf(line, sizeof(line), "sqlite %s: %s", what,
+             db ? sqlite3_errmsg(db) : "no handle");
+    write_diag_log(line);
+}
+
+bool exec_sql(sqlite3 *db, const char *sql)
+{
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        char line[300];
+        snprintf(line, sizeof(line), "sqlite exec FAIL %s sql=%.60s",
+                 err ? err : "?", sql);
+        write_diag_log(line);
+        if (err) sqlite3_free(err);
+        return false;
+    }
+    return true;
+}
+
+sqlite3 *open_state_db(bool readonly)
+{
+    sqlite3 *db = NULL;
+    int flags = readonly ? SQLITE_OPEN_READONLY
+                         : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    if (sqlite3_open_v2(STATE_DB_PATH, &db, flags, NULL) == SQLITE_OK) return db;
+    if (db) sqlite3_close(db);
+    db = NULL;
+    if (sqlite3_open_v2(STATE_DB_FALLBACK, &db, flags, NULL) == SQLITE_OK) return db;
+    if (!readonly) diag_sqlite("open FAIL", db);
+    if (db) sqlite3_close(db);
+    return NULL;
+}
+
+void save_state()
+{
+    sqlite3 *db = open_state_db(false);
+    if (!db) return;
+
+    bool ok = exec_sql(db,
+        "BEGIN;"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE IF NOT EXISTS feeds(idx INTEGER PRIMARY KEY,"
+        " name TEXT NOT NULL, url TEXT NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS articles(feed_idx INTEGER, art_idx INTEGER,"
+        " title TEXT, meta TEXT, body TEXT, unread INTEGER, saved INTEGER,"
+        " PRIMARY KEY(feed_idx, art_idx));"
+        "DELETE FROM feeds;"
+        "DELETE FROM articles;");
+
+    sqlite3_stmt *st = NULL;
+    if (ok && sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO meta VALUES('sync',?1)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, sync_str, -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+
+    if (ok && sqlite3_prepare_v2(db,
+            "INSERT INTO feeds VALUES(?1,?2,?3)", -1, &st, NULL) == SQLITE_OK) {
+        for (int i = 0; ok && i < feed_count; ++i) {
+            sqlite3_reset(st);
+            sqlite3_bind_int(st, 1, i);
+            sqlite3_bind_text(st, 2, feeds[i].name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, feeds[i].url, -1, SQLITE_STATIC);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (ok && sqlite3_prepare_v2(db,
+            "INSERT INTO articles VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            -1, &st, NULL) == SQLITE_OK) {
+        for (int i = 0; ok && i < feed_count; ++i) {
+            int count = feeds[i].count;
+            if (count > MAX_FEED_ARTICLES) count = MAX_FEED_ARTICLES;
+            for (int j = 0; ok && j < count; ++j) {
+                const Article &a = feeds[i].articles[j];
+                sqlite3_reset(st);
+                sqlite3_bind_int(st, 1, i);
+                sqlite3_bind_int(st, 2, j);
+                sqlite3_bind_text(st, 3, a.title, -1, SQLITE_STATIC);
+                sqlite3_bind_text(st, 4, a.meta, -1, SQLITE_STATIC);
+                sqlite3_bind_text(st, 5, a.body, -1, SQLITE_STATIC);
+                sqlite3_bind_int(st, 6, a.unread ? 1 : 0);
+                sqlite3_bind_int(st, 7, saved[i][j] ? 1 : 0);
+                ok = sqlite3_step(st) == SQLITE_DONE;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (!ok) diag_sqlite("save FAIL", db);
+    exec_sql(db, ok ? "COMMIT;" : "ROLLBACK;");
+    sqlite3_close(db);
+}
+
+bool load_state()
+{
+    sqlite3 *db = open_state_db(true);
+    if (!db) return false;
+
+    char loaded_sync[16] = "";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='sync'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(st, 0);
+            if (v) snprintf(loaded_sync, sizeof(loaded_sync), "%s", (const char *)v);
+        }
+        sqlite3_finalize(st);
+    }
+
+    int fc = 0;
+    if (sqlite3_prepare_v2(db, "SELECT idx,name,url FROM feeds ORDER BY idx",
+                           -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW && fc < MAX_FEEDS) {
+        const unsigned char *name = sqlite3_column_text(st, 1);
+        const unsigned char *url = sqlite3_column_text(st, 2);
+        snprintf(feed_name_buffers[fc], sizeof(feed_name_buffers[fc]),
+                 "%s", name ? (const char *)name : "Feed");
+        snprintf(feed_url_buffers[fc], sizeof(feed_url_buffers[fc]),
+                 "%s", url ? (const char *)url : "");
+        fc++;
+    }
+    sqlite3_finalize(st);
+    if (fc < 1) {
+        sqlite3_close(db);
+        return false;
+    }
+
+    int counts[MAX_FEEDS];
+    memset(counts, 0, sizeof(counts));
+    if (sqlite3_prepare_v2(db,
+            "SELECT feed_idx,art_idx,title,meta,body,unread,saved"
+            " FROM articles ORDER BY feed_idx,art_idx", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int i = sqlite3_column_int(st, 0);
+        if (i < 0 || i >= fc) continue;
+        int j = counts[i];
+        if (j >= MAX_FEED_ARTICLES) continue;
+        FeedArticleStore &store = fetched_feed_store[i];
+        const unsigned char *title = sqlite3_column_text(st, 2);
+        const unsigned char *meta = sqlite3_column_text(st, 3);
+        const unsigned char *body = sqlite3_column_text(st, 4);
+        snprintf(store.titles[j], TITLE_BUF, "%s",
+                 title ? (const char *)title : "Untitled");
+        snprintf(store.metas[j], META_BUF, "%s",
+                 meta ? (const char *)meta : "");
+        snprintf(store.bodies[j], BODY_BUF, "%s",
+                 body ? (const char *)body : "");
+        store.articles[j] = (Article){store.titles[j], store.metas[j],
+                                      sqlite3_column_int(st, 5) != 0,
+                                      store.bodies[j]};
+        saved[i][j] = sqlite3_column_int(st, 6) != 0;
+        counts[i]++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+
+    for (int i = 0; i < fc; ++i)
+        if (counts[i] < 1) return false;
+
+    for (int i = 0; i < fc; ++i)
+        feeds[i] = (Feed){feed_name_buffers[i], feed_url_buffers[i],
+                          fetched_feed_store[i].articles, counts[i]};
+    feed_count = fc;
+    if (loaded_sync[0]) snprintf(sync_str, sizeof(sync_str), "%s", loaded_sync);
+
+    char line[120];
+    snprintf(line, sizeof(line), "sqlite state loaded feeds=%d", fc);
+    write_diag_log(line);
+    return true;
+}
+
+bool ensure_network_connected()
+{
+    char logline[160];
+    int q = QueryNetwork();
+    snprintf(logline, sizeof(logline), "NET query=0x%x state=%d", q, GetNetState());
+    write_sync_log(logline);
+    if (q & NET_CONNECTED) return true;
+
+    int rc = NetConnect2(NULL, 1);
+    snprintf(logline, sizeof(logline), "NET connect rc=%d query=0x%x", rc, QueryNetwork());
+    write_sync_log(logline);
+    return rc == NET_OK;
+}
+
 void refresh_all_feeds()
 {
+    write_sync_log("--- sync start ---");
+    if (!ensure_network_connected()) {
+        Message(ICON_ERROR, (char *)"Sync failed",
+                (char *)"No network connection. Connect to Wi-Fi and try again.", 4000);
+        return;
+    }
+
     char *scratch = (char *)malloc(MAX_FEED_BYTES);
     if (!scratch) {
         Message(ICON_ERROR, (char *)"Sync failed", (char *)"Not enough memory.", 3000);
@@ -1619,7 +1882,6 @@ void refresh_all_feeds()
 
     ShowHourglass();
     OpenProgressbar(ICON_INFORMATION, "Sync now", "Fetching feeds", 0, NULL);
-    write_sync_log("--- sync start ---");
     int ok = 0;
     char error[96] = "";
     char status[240];
@@ -1648,6 +1910,8 @@ void refresh_all_feeds()
     feed_page = art_page = read_page = 0;
     view = VIEW_FEEDS;
     draw_screen();
+
+    if (ok > 0) save_state();
 
     if (ok == 0) {
         snprintf(status, sizeof(status), "No feeds updated. Last error: %s", error);
@@ -1678,6 +1942,7 @@ void feed_keyboard_done(char *text)
     if (text && *text) {
         if (keyboard_mode == 1) rename_feed(keyboard_feed_idx, text);
         else if (keyboard_mode == 2) update_feed_url(keyboard_feed_idx, text);
+        save_state();
     }
 
     keyboard_mode = 0;
@@ -1759,31 +2024,39 @@ void delete_feed(int idx)
         feed_settings_page = feed_settings_pages() - 1;
     if (feed_page < 0) feed_page = 0;
     if (feed_settings_page < 0) feed_settings_page = 0;
+    save_state();
     draw_screen();
 }
 
 void open_url(const char *url)
 {
-    char logline[360];
+    char logline[420];
     snprintf(logline, sizeof(logline), "open-link url=%s", url);
     write_diag_log(logline);
 
+    const char *browser = BROWSER_FOR_AUTH;
+    int browser_exists = access(browser, F_OK) == 0;
+    snprintf(logline, sizeof(logline), "open-link browser=%s exists=%d multitask=%d",
+             browser, browser_exists, MultitaskingSupported());
+    write_diag_log(logline);
+
+    if (browser_exists) {
+        char *args[] = {(char *)url, NULL};
+        int task = NewTaskEx(browser, args, "browser", "Browser", NULL, 0, 0);
+        snprintf(logline, sizeof(logline), "open-link newtaskex task=%d", task);
+        write_diag_log(logline);
+        if (task > 0) return;
+
+        int rc_browser = OpenBook(browser, url, 0);
+        snprintf(logline, sizeof(logline), "open-link openbook-browser rc=%d", rc_browser);
+        write_diag_log(logline);
+        if (rc_browser == 0) return;
+    }
+
     int rc_direct = OpenBook(url, "", 0);
-    snprintf(logline, sizeof(logline), "open-link direct rc=%d", rc_direct);
+    snprintf(logline, sizeof(logline), "open-link openbook-direct rc=%d", rc_direct);
     write_diag_log(logline);
-    if (rc_direct == 0) return;
-
-    int rc_browser = OpenBook(BROWSER_FOR_AUTH, url, 0);
-    snprintf(logline, sizeof(logline), "open-link browser-param rc=%d browser=%s",
-             rc_browser, BROWSER_FOR_AUTH);
-    write_diag_log(logline);
-    if (rc_browser == 0) return;
-
-    const char *argv[] = {BROWSER_FOR_AUTH, url};
-    int rc_browser2 = OpenBook2(BROWSER_FOR_AUTH, 2, argv, 0);
-    snprintf(logline, sizeof(logline), "open-link browser-argv rc=%d", rc_browser2);
-    write_diag_log(logline);
-    if (rc_browser2 == 0) return;
+    if (rc_direct == 0 && browser_exists) return;
 
     Message(ICON_WARNING, (char *)"Open link",
             (char *)"Could not open the browser for this link. See diagnostics log.", 4000);
@@ -2103,6 +2376,7 @@ int main_handler(int event_type, int param_one, int param_two)
         SetPanelType(PANEL_DISABLED);
         xmlInitParser();
         memset(saved, 0, sizeof(saved));
+        load_state();
         open_fonts();
         refresh_date();
         draw_screen();
@@ -2123,6 +2397,7 @@ int main_handler(int event_type, int param_one, int param_two)
         handle_key(param_one);
         draw_debug_overlay();
     } else if (event_type == EVT_EXIT) {
+        save_state();
         close_fonts();
         xmlCleanupParser();
     }
