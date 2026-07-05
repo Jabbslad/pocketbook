@@ -315,6 +315,9 @@ const int MAX_PAGES = 32;
 char body_buf[4096];
 const char *paras[MAX_PARAS];
 int para_count = 0;
+int para_h[MAX_PARAS];   // cached layout heights (current body font)
+int read_title_h = 0;    // cached title block height
+int read_line_h = 0;     // cached single line height
 int page_start[MAX_PAGES + 1];
 int read_pages = 1;
 int read_body_top = 0;  // body y on page 1 (below title block)
@@ -336,7 +339,8 @@ int drag_start_y = 0;
 int drag_start_scroll = 0;
 int drag_last_drawn = 0;
 bool drag_active = false;
-bool fast_update_hint = false;  // draw with a flash-free update during drags
+bool fast_update_hint = false;  // draw with a flash-free update (settle)
+bool drag_frame_hint = false;   // content-only render + DU waveform (drag)
 
 // Prev-button hold detection in scrollable reading mode.
 long long prev_key_down_ms = 0;
@@ -768,15 +772,19 @@ void paginate_article()
         if (nl) { *nl = 0; p = nl + 1; } else { p = 0; }
     }
 
-    // Height of the title block on page 1.
+    // Height of the title block on page 1. Layout measurement is the
+    // expensive part (FreeType shaping), so cache everything here; drag
+    // frames in scroll mode reuse the cached heights.
     SetFont(f_title_b, C_BLACK);
     int th = TextRectHeight(cw, (char *)a.title, ALIGN_LEFT);
+    read_title_h = th;
     int rule_y = 126 + th + 24;
     read_body_top = rule_y + 3 + 40;
 
     int footer_top = h - READ_FOOTER_H - 3;
     SetFont(f_body, C_BLACK);
     int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
+    read_line_h = line_h;
 
     int page = 0, cur = 0;
     page_start[0] = 0;
@@ -786,6 +794,7 @@ void paginate_article()
         int ph = is_link_paragraph(paras[i], lurl, sizeof(lurl))
                      ? line_h
                      : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+        para_h[i] = ph;
         int need = (cur > 0 ? PARA_GAP : 0) + ph;
         if (cur > 0 && cur + need > avail && page + 1 < MAX_PAGES) {
             page++;
@@ -883,6 +892,24 @@ void draw_feeds()
     int w = ScreenWidth();
     char buf[160];
 
+    bool content_only = drag_frame_hint && list_scroll_mode;
+    if (content_only) {
+        compute_feed_order();
+        int top = 228;
+        int h = ScreenHeight();
+        FillArea(0, top, w, h - top, C_WHITE);
+        SetClip(0, top, w, h - top);
+        for (int idx = 0; idx < feed_count; ++idx) {
+            int y = top - feed_scroll + idx * FEED_ROW_H;
+            if (y + FEED_ROW_H <= top || y >= h) continue;
+            draw_feed_row(feeds[feed_order[idx]], y, w, buf, sizeof(buf));
+        }
+        SetClip(0, 0, w, h);
+        draw_scrollbar(top, h - top, feed_count * FEED_ROW_H, feed_scroll);
+        DynamicUpdateBW(0, top, w, h - top);
+        return;
+    }
+
     ClearScreen();
 
     // Masthead.
@@ -957,18 +984,23 @@ void draw_articles()
     int w = ScreenWidth();
     const Feed &f = feeds[sel_feed];
     char buf[64];
+    bool content_only = drag_frame_hint && list_scroll_mode;
 
-    ClearScreen();
+    if (!content_only) {
+        ClearScreen();
 
-    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 All feeds",
-         ALIGN_LEFT | VALIGN_TOP);
-    z_back = (Zone){0, 0, 700, 216};
-    text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, f.name,
-         ALIGN_LEFT | VALIGN_TOP | DOTS);
-    snprintf(buf, sizeof(buf), "%d unread of %d", feed_unread(f), f.count);
-    text(f_meta_i, w - PAD - 320, 168, 320, 36, buf,
-         ALIGN_RIGHT | VALIGN_TOP);
-    rule(PAD, 210, w - PAD * 2, 6);
+        text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 All feeds",
+             ALIGN_LEFT | VALIGN_TOP);
+        z_back = (Zone){0, 0, 700, 216};
+        text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, f.name,
+             ALIGN_LEFT | VALIGN_TOP | DOTS);
+        snprintf(buf, sizeof(buf), "%d unread of %d", feed_unread(f), f.count);
+        text(f_meta_i, w - PAD - 320, 168, 320, 36, buf,
+             ALIGN_RIGHT | VALIGN_TOP);
+        rule(PAD, 210, w - PAD * 2, 6);
+    } else {
+        FillArea(0, 216, w, ScreenHeight() - 216, C_WHITE);
+    }
 
     compute_visible_articles();
     z_reveal_read = (Zone){0, 0, 0, 0};
@@ -1018,6 +1050,10 @@ void draw_articles()
                 draw_hidden_read_row(y, w, buf, sizeof(buf));
         }
         draw_list_footer(art_page, article_pages());
+    }
+    if (content_only) {
+        DynamicUpdateBW(0, top, w, h - top);
+        return;
     }
     if (fast_update_hint) SoftUpdate();
     else FullUpdate();
@@ -1341,26 +1377,23 @@ void draw_reading_scrolled()
     int cw = w - READ_PAD * 2;
     char buf[160];
 
-    ClearScreen();
-
     int top = PAD;
     int footer_top = h - READ_FOOTER_H - 3;
     int avail = footer_top - top;
 
-    SetFont(f_title_b, C_BLACK);
-    int th = TextRectHeight(cw, (char *)a.title, ALIGN_LEFT);
-    SetFont(f_body, C_BLACK);
-    int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
+    // Drag frames only repaint the scrolled content region and push it
+    // with the fast DU waveform; chrome is untouched in the framebuffer.
+    bool content_only = drag_frame_hint;
+    if (content_only) FillArea(0, top, w, avail, C_WHITE);
+    else ClearScreen();
 
-    // Total content height: meta + title + rule + body paragraphs.
+    int th = read_title_h;
+    int line_h = read_line_h;
+
+    // Total content height: meta + title + rule + body paragraphs
+    // (all heights cached by paginate_article).
     int total = 36 + 18 + th + 24 + 3 + 40;
-    for (int i = 0; i < para_count; ++i) {
-        char url[256];
-        total += (is_link_paragraph(paras[i], url, sizeof(url))
-                      ? line_h
-                      : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT)) +
-                 PARA_GAP;
-    }
+    for (int i = 0; i < para_count; ++i) total += para_h[i] + PARA_GAP;
 
     read_max_scroll = total - avail;
     if (read_max_scroll < 0) read_max_scroll = 0;
@@ -1390,8 +1423,7 @@ void draw_reading_scrolled()
     for (int i = 0; i < para_count && y < footer_top; ++i) {
         char url[256];
         bool is_link = is_link_paragraph(paras[i], url, sizeof(url));
-        int ph = is_link ? line_h
-                         : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+        int ph = para_h[i];
         if (y + ph > top) {
             if (is_link) {
                 DrawTextRect(READ_PAD, y, cw, line_h, (char *)paras[i],
@@ -1410,6 +1442,11 @@ void draw_reading_scrolled()
         y += ph + PARA_GAP;
     }
     SetClip(0, 0, w, h);
+
+    if (content_only) {
+        DynamicUpdateBW(0, top, w, avail);
+        return;
+    }
 
     int pct = total <= avail
                   ? 100
@@ -3214,10 +3251,10 @@ int main_handler(int event_type, int param_one, int param_two)
             if (pos < 0) pos = 0;
             if (pos > max_scroll) pos = max_scroll;
             *target = pos;
-            if (abs(*target - drag_last_drawn) >= 120) {
-                fast_update_hint = true;
+            if (abs(*target - drag_last_drawn) >= 48) {
+                drag_frame_hint = true;
                 draw_screen();
-                fast_update_hint = false;
+                drag_frame_hint = false;
                 drag_last_drawn = *target;
             }
         }
