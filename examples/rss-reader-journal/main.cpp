@@ -328,6 +328,10 @@ bool list_scroll_mode = false;
 int feed_scroll = 0, feed_max_scroll = 0;
 int art_scroll = 0, art_max_scroll = 0;
 
+// Immersive reading: the footer is hidden by default and overlays the
+// text only after a tap; scrolling or page turns hide it again.
+bool reading_footer_visible = false;
+
 // Scrollable reading mode (Settings > Article view).
 bool scroll_mode = false;
 int read_scroll = 0;       // pixel offset into the article content
@@ -781,7 +785,7 @@ void paginate_article()
     int rule_y = 126 + th + 24;
     read_body_top = rule_y + 3 + 40;
 
-    int footer_top = h - READ_FOOTER_H - 3;
+    int footer_top = h - 24;  // footer is a tap-summoned overlay now
     SetFont(f_body, C_BLACK);
     int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
     read_line_h = line_h;
@@ -1333,6 +1337,7 @@ void draw_reading_footer(const char *center)
     int w = ScreenWidth();
     int h = ScreenHeight();
     int ftop = h - READ_FOOTER_H;
+    FillArea(0, ftop - 3, w, READ_FOOTER_H + 3, C_WHITE);  // overlay backdrop
     rule(0, ftop - 3, w, 3);
     int cy = ftop + READ_FOOTER_H / 2;
     bool is_saved = saved[sel_feed][sel_article];
@@ -1377,14 +1382,17 @@ void draw_reading_scrolled()
     int cw = w - READ_PAD * 2;
     char buf[160];
 
+    // Content owns the full height; the footer is a tap-summoned overlay.
     int top = PAD;
-    int footer_top = h - READ_FOOTER_H - 3;
+    int footer_top = h - 24;
     int avail = footer_top - top;
 
+    z_save = z_aa = z_next_article = (Zone){0, 0, 0, 0};
+
     // Drag frames only repaint the scrolled content region and push it
-    // with the fast DU waveform; chrome is untouched in the framebuffer.
+    // with the fast DU waveform.
     bool content_only = drag_frame_hint;
-    if (content_only) FillArea(0, top, w, avail, C_WHITE);
+    if (content_only) FillArea(0, top, w, h - top, C_WHITE);
     else ClearScreen();
 
     int th = read_title_h;
@@ -1444,16 +1452,18 @@ void draw_reading_scrolled()
     SetClip(0, 0, w, h);
 
     if (content_only) {
-        DynamicUpdateBW(0, top, w, avail);
+        DynamicUpdateBW(0, top, w, h - top);
         return;
     }
 
-    int pct = total <= avail
-                  ? 100
-                  : (int)(((long)(read_scroll + avail)) * 100 / total);
-    if (pct > 100) pct = 100;
-    snprintf(buf, sizeof(buf), "%d%%", pct);
-    draw_reading_footer(buf);
+    if (reading_footer_visible) {
+        int pct = total <= avail
+                      ? 100
+                      : (int)(((long)(read_scroll + avail)) * 100 / total);
+        if (pct > 100) pct = 100;
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+        draw_reading_footer(buf);
+    }
     if (fast_update_hint) SoftUpdate();
     else FullUpdate();
 }
@@ -1505,9 +1515,13 @@ void draw_reading_paginated()
         }
     }
 
-    snprintf(buf, sizeof(buf), "Page %d of %d", read_page + 1, read_pages);
-    draw_reading_footer(buf);
-    FullUpdate();
+    z_save = z_aa = z_next_article = (Zone){0, 0, 0, 0};
+    if (reading_footer_visible) {
+        snprintf(buf, sizeof(buf), "Page %d of %d", read_page + 1, read_pages);
+        draw_reading_footer(buf);
+    }
+    if (fast_update_hint) SoftUpdate();
+    else FullUpdate();
 }
 
 void draw_reading()
@@ -1536,6 +1550,7 @@ void open_article(int fi, int ai)
     feeds[fi].articles[ai].unread = false;
     read_page = 0;
     read_scroll = 0;
+    reading_footer_visible = false;
     view = VIEW_READING;
     paginate_article();
 }
@@ -2853,6 +2868,7 @@ void page_delta(int d)
         int next = read_page + d;
         if (next >= 0 && next < read_pages) {
             read_page = next;
+            reading_footer_visible = false;  // page turns hide the footer
             draw_screen();
         } else if (d > 0) {
             open_next_unread_article();
@@ -3020,7 +3036,8 @@ void handle_tap(int x, int y)
         return;
     }
 
-    // Reading view.
+    // Reading view: footer controls first, then links, otherwise a tap
+    // toggles the footer overlay.
     if (hit(z_save, x, y)) {
         saved[sel_feed][sel_article] = !saved[sel_feed][sel_article];
         draw_screen();
@@ -3040,6 +3057,10 @@ void handle_tap(int x, int y)
                 return;
             }
         }
+        reading_footer_visible = !reading_footer_visible;
+        fast_update_hint = true;
+        draw_screen();
+        fast_update_hint = false;
     }
 }
 
@@ -3246,6 +3267,8 @@ int main_handler(int event_type, int param_one, int param_two)
         int max_scroll;
         int *target = drag_scroll_target(&max_scroll);
         if (target) {
+            if (!drag_active && view == VIEW_READING)
+                reading_footer_visible = false;  // scrolling hides the footer
             drag_active = true;
             int pos = drag_start_scroll + (drag_start_y - param_two);
             if (pos < 0) pos = 0;
