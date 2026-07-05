@@ -1397,7 +1397,30 @@ size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     return size * nmemb;
 }
 
-bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
+bool fetch_url_with_quickdownload(const char *url, char *buffer, int cap,
+                                  char *error, int error_cap)
+{
+    int size = 0;
+    int err = 0;
+    void *data = QuickDownloadExt3(url, &size, 30000, NULL, NULL, &err);
+    if (!data || size <= 0) {
+        snprintf(error, error_cap, "QuickDownload failed (%d)", err);
+        if (data) free(data);
+        return false;
+    }
+    if (size >= cap) {
+        snprintf(error, error_cap, "feed too large");
+        free(data);
+        return false;
+    }
+    memcpy(buffer, data, size);
+    buffer[size] = 0;
+    free(data);
+    return true;
+}
+
+bool fetch_url_with_curl(const char *url, char *buffer, int cap,
+                         char *error, int error_cap)
 {
     CurlRuntime curl;
     if (!load_curl(&curl, error, error_cap)) return false;
@@ -1444,6 +1467,33 @@ bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_ca
 
     unload_curl(&curl);
     return ok;
+}
+
+bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_cap)
+{
+    char curl_error[96] = "";
+    char logline[360];
+    if (fetch_url_with_curl(url, buffer, cap, curl_error, sizeof(curl_error))) {
+        snprintf(logline, sizeof(logline), "FETCH curl OK url=%s", url);
+        write_sync_log(logline);
+        return true;
+    }
+
+    snprintf(logline, sizeof(logline), "FETCH curl FAIL error=%s url=%s",
+             curl_error, url);
+    write_sync_log(logline);
+
+    if (fetch_url_with_quickdownload(url, buffer, cap, error, error_cap)) {
+        snprintf(logline, sizeof(logline), "FETCH quickdownload OK url=%s", url);
+        write_sync_log(logline);
+        return true;
+    }
+
+    snprintf(logline, sizeof(logline), "FETCH quickdownload FAIL error=%s url=%s",
+             error, url);
+    write_sync_log(logline);
+    snprintf(error, error_cap, "curl: %s; native: %s", curl_error, error);
+    return false;
 }
 
 int field_for_name(const char *name)
