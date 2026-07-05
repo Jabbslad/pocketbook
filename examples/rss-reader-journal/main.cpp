@@ -402,7 +402,56 @@ int total_unread()
 
 int feed_pages()
 {
-    return (feed_count + LIST_ROWS - 1) / LIST_ROWS;
+    // + 2 pinned virtual rows (Starred / All Articles)
+    return (feed_count + 2 + LIST_ROWS - 1) / LIST_ROWS;
+}
+
+// Virtual feeds pinned to the top of the feed list: Starred (every saved
+// article) and All Articles (everything, newest first). They reference
+// real articles by (feed, article) pairs.
+const int VMODE_NONE = 0;
+const int VMODE_ALL = 1;
+const int VMODE_STARRED = 2;
+
+struct VRef {
+    unsigned char feed;
+    unsigned char art;
+};
+VRef vlist[MAX_FEEDS * MAX_FEED_ARTICLES];
+int vlist_count = 0;
+int vfeed_mode = VMODE_NONE;  // which virtual list VIEW_ARTICLES shows
+int v_sel = 0;                // vlist index of the open article
+
+const Article &vref_article(const VRef &r)
+{
+    return feeds[r.feed].articles[r.art];
+}
+
+void build_virtual_list(int mode)
+{
+    vlist_count = 0;
+    for (int f = 0; f < feed_count; ++f) {
+        int count = feeds[f].count;
+        if (count > MAX_FEED_ARTICLES) count = MAX_FEED_ARTICLES;
+        for (int a = 0; a < count; ++a) {
+            if (mode == VMODE_STARRED && !saved[f][a]) continue;
+            vlist[vlist_count].feed = (unsigned char)f;
+            vlist[vlist_count].art = (unsigned char)a;
+            vlist_count++;
+        }
+    }
+
+    // Newest first; stable for equal/unknown timestamps.
+    for (int i = 1; i < vlist_count; ++i) {
+        VRef v = vlist[i];
+        time_t tv = vref_article(v).when;
+        int j = i - 1;
+        while (j >= 0 && vref_article(vlist[j]).when < tv) {
+            vlist[j + 1] = vlist[j];
+            j--;
+        }
+        vlist[j + 1] = v;
+    }
 }
 
 // Hide-read setting (Settings > Read articles): article lists show only
@@ -410,16 +459,29 @@ int feed_pages()
 // reveal_read temporarily shows everything for the current feed visit.
 bool hide_read = false;
 bool reveal_read = false;
-int visible_articles[MAX_FEED_ARTICLES];
+int visible_articles[MAX_FEEDS * MAX_FEED_ARTICLES];
 int visible_article_count = 0;
 int hidden_read_count = 0;
 
+// In virtual mode entries index vlist; otherwise the current feed's array.
 void compute_visible_articles()
 {
-    const Feed &f = feeds[sel_feed];
     visible_article_count = 0;
     hidden_read_count = 0;
     bool hiding = hide_read && !reveal_read;
+
+    if (vfeed_mode != VMODE_NONE) {
+        for (int j = 0; j < vlist_count; ++j) {
+            if (hiding && !vref_article(vlist[j]).unread) {
+                hidden_read_count++;
+                continue;
+            }
+            visible_articles[visible_article_count++] = j;
+        }
+        return;
+    }
+
+    const Feed &f = feeds[sel_feed];
     for (int j = 0; j < f.count; ++j) {
         if (hiding && !f.articles[j].unread) {
             hidden_read_count++;
@@ -859,6 +921,62 @@ void draw_scrollbar(int top, int view_h, int total, int offset)
     FillArea(x, thumb_y, 4, thumb_h, C_BLACK);
 }
 
+// Pinned virtual rows at the top of the feed list.
+const int PINNED_ROWS = 2;  // 0 = Starred Articles, 1 = All Articles
+
+void pinned_row_stats(int which, int *count, bool *has_unread,
+                      const char **latest_title)
+{
+    *count = 0;
+    *has_unread = false;
+    *latest_title = "";
+    time_t best = -1;
+    for (int f = 0; f < feed_count; ++f) {
+        int n = feeds[f].count;
+        if (n > MAX_FEED_ARTICLES) n = MAX_FEED_ARTICLES;
+        for (int a = 0; a < n; ++a) {
+            const Article &art = feeds[f].articles[a];
+            if (which == 0) {  // Starred
+                if (!saved[f][a]) continue;
+                (*count)++;
+                if (art.unread) *has_unread = true;
+            } else {  // All: badge counts unread
+                if (art.unread) {
+                    (*count)++;
+                    *has_unread = true;
+                }
+            }
+            if (art.when > best) {
+                best = art.when;
+                *latest_title = art.title;
+            }
+        }
+    }
+}
+
+void draw_pinned_feed_row(int which, int y, int w, char *buf, int buf_cap)
+{
+    int count;
+    bool has_unread;
+    const char *latest;
+    pinned_row_stats(which, &count, &has_unread, &latest);
+
+    text(has_unread ? f_row_b : f_row, PAD, y + 26, w - PAD * 2 - 180, 52,
+         which == 0 ? "Starred Articles" : "All Articles",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 86, w - PAD * 2 - 180, 36,
+         latest, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    if (count > 0) {
+        snprintf(buf, buf_cap, "%d", count);
+        text(has_unread ? f_40_b : f_40, w - PAD - 160, y, 160, FEED_ROW_H,
+             buf, ALIGN_RIGHT | VALIGN_MIDDLE);
+    } else {
+        text(f_40, w - PAD - 160, y, 160, FEED_ROW_H,
+             "\xE2\x80\x94", ALIGN_RIGHT | VALIGN_MIDDLE);
+    }
+    rule(PAD, y + FEED_ROW_H - 2, w - PAD * 2, 2, C_RULE);
+}
+
 void draw_feed_row(const Feed &f, int y, int w, char *buf, int buf_cap)
 {
     int unread = feed_unread(f);
@@ -884,7 +1002,8 @@ void draw_hidden_read_row(int y, int w, char *buf, int buf_cap)
     text(f_meta_i, 0, y, w, ART_ROW_H, buf, ALIGN_CENTER | VALIGN_MIDDLE);
 }
 
-void draw_article_row(const Article &a, int y, int w, char *buf, int buf_cap)
+void draw_article_row(const Article &a, const char *src_feed, int y, int w,
+                      char *buf, int buf_cap)
 {
     // Unread marker: filled dot; read: ring.
     if (a.unread) {
@@ -897,16 +1016,27 @@ void draw_article_row(const Article &a, int y, int w, char *buf, int buf_cap)
     int tx = PAD + 22 + 30;
     text(a.unread ? f_40_b : f_40, tx, y + 32, w - PAD - tx, 52,
          a.title, ALIGN_LEFT | VALIGN_TOP | DOTS);
-    snprintf(buf, buf_cap, "%s%s", a.meta, a.unread ? "" : " \xC2\xB7 read");
+    snprintf(buf, buf_cap, "%s%s%s%s", src_feed ? src_feed : "",
+             src_feed ? " \xC2\xB7 " : "", a.meta,
+             a.unread ? "" : " \xC2\xB7 read");
     text(f_meta_i, tx, y + 92, w - PAD - tx, 36, buf,
          ALIGN_LEFT | VALIGN_TOP | DOTS);
     rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2, C_RULE);
+}
+
+// Row idx in the feed list: 0..PINNED_ROWS-1 are the virtual rows,
+// the rest map through feed_order.
+void draw_feed_list_row(int idx, int y, int w, char *buf, int buf_cap)
+{
+    if (idx < PINNED_ROWS) draw_pinned_feed_row(idx, y, w, buf, buf_cap);
+    else draw_feed_row(feeds[feed_order[idx - PINNED_ROWS]], y, w, buf, buf_cap);
 }
 
 void draw_feeds()
 {
     int w = ScreenWidth();
     char buf[160];
+    int list_rows_total = feed_count + PINNED_ROWS;
 
     bool content_only = drag_frame_hint && list_scroll_mode;
     if (content_only) {
@@ -915,13 +1045,13 @@ void draw_feeds()
         int h = ScreenHeight();
         FillArea(0, top, w, h - top, C_WHITE);
         SetClip(0, top, w, h - top);
-        for (int idx = 0; idx < feed_count; ++idx) {
+        for (int idx = 0; idx < list_rows_total; ++idx) {
             int y = top - feed_scroll + idx * FEED_ROW_H;
             if (y + FEED_ROW_H <= top || y >= h) continue;
-            draw_feed_row(feeds[feed_order[idx]], y, w, buf, sizeof(buf));
+            draw_feed_list_row(idx, y, w, buf, sizeof(buf));
         }
         SetClip(0, 0, w, h);
-        draw_scrollbar(top, h - top, feed_count * FEED_ROW_H, feed_scroll);
+        draw_scrollbar(top, h - top, list_rows_total * FEED_ROW_H, feed_scroll);
         DynamicUpdateBW(0, top, w, h - top);
         return;
     }
@@ -968,26 +1098,25 @@ void draw_feeds()
         int top = 228;
         int h = ScreenHeight();
         int view_h = h - top;
-        int total = feed_count * FEED_ROW_H;
+        int total = list_rows_total * FEED_ROW_H;
         feed_max_scroll = total - view_h;
         if (feed_max_scroll < 0) feed_max_scroll = 0;
         if (feed_scroll > feed_max_scroll) feed_scroll = feed_max_scroll;
         if (feed_scroll < 0) feed_scroll = 0;
 
         SetClip(0, top, w, view_h);
-        for (int idx = 0; idx < feed_count; ++idx) {
+        for (int idx = 0; idx < list_rows_total; ++idx) {
             int y = top - feed_scroll + idx * FEED_ROW_H;
             if (y + FEED_ROW_H <= top || y >= h) continue;
-            draw_feed_row(feeds[feed_order[idx]], y, w, buf, sizeof(buf));
+            draw_feed_list_row(idx, y, w, buf, sizeof(buf));
         }
         SetClip(0, 0, w, h);
         draw_scrollbar(top, view_h, total, feed_scroll);
     } else {
         for (int i = 0; i < LIST_ROWS; ++i) {
             int idx = feed_page * LIST_ROWS + i;
-            if (idx >= feed_count) break;
-            draw_feed_row(feeds[feed_order[idx]], 228 + i * FEED_ROW_H, w,
-                          buf, sizeof(buf));
+            if (idx >= list_rows_total) break;
+            draw_feed_list_row(idx, 228 + i * FEED_ROW_H, w, buf, sizeof(buf));
         }
         draw_list_footer(feed_page, feed_pages());
     }
@@ -1001,6 +1130,7 @@ void draw_articles()
     const Feed &f = feeds[sel_feed];
     char buf[64];
     bool content_only = drag_frame_hint && list_scroll_mode;
+    bool virt = vfeed_mode != VMODE_NONE;
 
     if (!content_only) {
         ClearScreen();
@@ -1008,9 +1138,23 @@ void draw_articles()
         text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 All feeds",
              ALIGN_LEFT | VALIGN_TOP);
         z_back = (Zone){0, 0, 700, 216};
-        text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, f.name,
+
+        const char *title = virt ? (vfeed_mode == VMODE_STARRED
+                                        ? "Starred Articles"
+                                        : "All Articles")
+                                 : f.name;
+        int total_n = virt ? vlist_count : f.count;
+        int unread_n = 0;
+        if (virt) {
+            for (int j = 0; j < vlist_count; ++j)
+                if (vref_article(vlist[j]).unread) unread_n++;
+        } else {
+            unread_n = feed_unread(f);
+        }
+
+        text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, title,
              ALIGN_LEFT | VALIGN_TOP | DOTS);
-        snprintf(buf, sizeof(buf), "%d unread of %d", feed_unread(f), f.count);
+        snprintf(buf, sizeof(buf), "%d unread of %d", unread_n, total_n);
         text(f_meta_i, w - PAD - 320, 168, 320, 36, buf,
              ALIGN_RIGHT | VALIGN_TOP);
         rule(PAD, 210, w - PAD * 2, 6);
@@ -1024,7 +1168,18 @@ void draw_articles()
     int top = 216;
     int h = ScreenHeight();
 
-    if (visible_article_count == 0 && hidden_read_count > 0) {
+    if (virt && vlist_count == 0) {
+        int cy = top + (h - top) / 2;
+        text(f_row_b, PAD, cy - 70, w - PAD * 2, 52,
+             vfeed_mode == VMODE_STARRED ? "No starred articles"
+                                         : "No articles yet",
+             ALIGN_CENTER | VALIGN_TOP);
+        text(f_meta_i, PAD, cy + 8, w - PAD * 2, 36,
+             vfeed_mode == VMODE_STARRED
+                 ? "Star articles from the reading view to collect them here"
+                 : "Sync to fetch articles",
+             ALIGN_CENTER | VALIGN_TOP);
+    } else if (visible_article_count == 0 && hidden_read_count > 0) {
         // Everything read and hidden: centered empty state, tap to reveal.
         int cy = top + (h - top) / 2;
         text(f_row_b, PAD, cy - 70, w - PAD * 2, 52, "All caught up",
@@ -1046,11 +1201,18 @@ void draw_articles()
         for (int idx = 0; idx < items; ++idx) {
             int y = top - art_scroll + idx * ART_ROW_H;
             if (y + ART_ROW_H <= top || y >= h) continue;
-            if (idx < visible_article_count)
-                draw_article_row(f.articles[visible_articles[idx]], y, w,
-                                 buf, sizeof(buf));
-            else
+            if (idx < visible_article_count) {
+                if (virt) {
+                    const VRef &r = vlist[visible_articles[idx]];
+                    draw_article_row(vref_article(r), feeds[r.feed].name, y, w,
+                                     buf, sizeof(buf));
+                } else {
+                    draw_article_row(f.articles[visible_articles[idx]], NULL,
+                                     y, w, buf, sizeof(buf));
+                }
+            } else {
                 draw_hidden_read_row(y, w, buf, sizeof(buf));
+            }
         }
         SetClip(0, 0, w, h);
         draw_scrollbar(top, view_h, total, art_scroll);
@@ -1059,11 +1221,18 @@ void draw_articles()
             int idx = art_page * LIST_ROWS + i;
             if (idx >= items) break;
             int y = top + i * ART_ROW_H;
-            if (idx < visible_article_count)
-                draw_article_row(f.articles[visible_articles[idx]], y, w,
-                                 buf, sizeof(buf));
-            else
+            if (idx < visible_article_count) {
+                if (virt) {
+                    const VRef &r = vlist[visible_articles[idx]];
+                    draw_article_row(vref_article(r), feeds[r.feed].name, y, w,
+                                     buf, sizeof(buf));
+                } else {
+                    draw_article_row(f.articles[visible_articles[idx]], NULL,
+                                     y, w, buf, sizeof(buf));
+                }
+            } else {
                 draw_hidden_read_row(y, w, buf, sizeof(buf));
+            }
         }
         draw_list_footer(art_page, article_pages());
     }
@@ -1705,6 +1874,19 @@ void next_article()
 void back_to_article_list()
 {
     view = VIEW_ARTICLES;
+    if (vfeed_mode != VMODE_NONE) {
+        // Stars may have changed while reading; rebuild before positioning.
+        build_virtual_list(vfeed_mode);
+        if (v_sel >= vlist_count) v_sel = vlist_count > 0 ? vlist_count - 1 : 0;
+        compute_visible_articles();
+        int pos = 0;
+        for (int i = 0; i < visible_article_count; ++i)
+            if (visible_articles[i] <= v_sel) pos = i;
+        art_page = pos / LIST_ROWS;
+        art_scroll = pos * ART_ROW_H;
+        draw_screen();
+        return;
+    }
     compute_visible_articles();
     int pos = 0;
     for (int i = 0; i < visible_article_count; ++i)
@@ -1714,10 +1896,33 @@ void back_to_article_list()
     draw_screen();
 }
 
+void open_virtual_feed(int mode)
+{
+    vfeed_mode = mode;
+    build_virtual_list(mode);
+    art_page = 0;
+    art_scroll = 0;
+    reveal_read = false;
+    view = VIEW_ARTICLES;
+    draw_screen();
+}
+
 // Next unread article in the current feed (forward only); if none remain,
 // return to the feed's article list.
 void open_next_unread_article()
 {
+    if (vfeed_mode != VMODE_NONE) {
+        for (int j = v_sel + 1; j < vlist_count; ++j) {
+            if (vref_article(vlist[j]).unread) {
+                v_sel = j;
+                open_article(vlist[j].feed, vlist[j].art);
+                draw_screen();
+                return;
+            }
+        }
+        back_to_article_list();
+        return;
+    }
     const Feed &f = feeds[sel_feed];
     for (int j = sel_article + 1; j < f.count; ++j) {
         if (f.articles[j].unread) {
@@ -1733,6 +1938,7 @@ void open_next_unread_article()
 // return to the feed list.
 void open_next_unread_feed()
 {
+    vfeed_mode = VMODE_NONE;
     compute_feed_order();
     int pos = 0;
     for (int i = 0; i < feed_count; ++i)
@@ -3207,8 +3413,12 @@ void handle_tap(int x, int y)
                           : feed_page * LIST_ROWS + (y - 228) / FEED_ROW_H;
             if (!list_scroll_mode && (y - 228) / FEED_ROW_H >= LIST_ROWS)
                 return;
-            if (idx >= 0 && idx < feed_count) {
-                sel_feed = feed_order[idx];
+            if (idx >= 0 && idx < PINNED_ROWS) {
+                open_virtual_feed(idx == 0 ? VMODE_STARRED : VMODE_ALL);
+            } else if (idx >= PINNED_ROWS &&
+                       idx < feed_count + PINNED_ROWS) {
+                vfeed_mode = VMODE_NONE;
+                sel_feed = feed_order[idx - PINNED_ROWS];
                 art_page = 0;
                 art_scroll = 0;
                 reveal_read = false;
@@ -3241,7 +3451,12 @@ void handle_tap(int x, int y)
             if (!list_scroll_mode && (y - 216) / ART_ROW_H >= LIST_ROWS)
                 return;
             if (row >= 0 && row < visible_article_count) {
-                open_article(sel_feed, visible_articles[row]);
+                if (vfeed_mode != VMODE_NONE) {
+                    v_sel = visible_articles[row];
+                    open_article(vlist[v_sel].feed, vlist[v_sel].art);
+                } else {
+                    open_article(sel_feed, visible_articles[row]);
+                }
                 draw_screen();
             } else if (row == visible_article_count && hidden_read_count > 0) {
                 reveal_read = true;

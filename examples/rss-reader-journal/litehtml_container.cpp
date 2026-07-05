@@ -29,6 +29,8 @@ int gray_of(litehtml::web_color c)
 struct PbFont {
     ifont *font;
     int height;
+    int ascent;
+    unsigned int decoration;
 };
 
 const char *face_for(int weight, bool italic)
@@ -51,7 +53,7 @@ PbHtmlContainer::PbHtmlContainer(int width, int default_font_px)
 litehtml::uint_ptr PbHtmlContainer::create_font(const char * /*faceName*/, int size,
                                                 int weight,
                                                 litehtml::font_style italic,
-                                                unsigned int /*decoration*/,
+                                                unsigned int decoration,
                                                 litehtml::font_metrics *fm)
 {
     PbFont *f = new PbFont();
@@ -59,11 +61,13 @@ litehtml::uint_ptr PbHtmlContainer::create_font(const char * /*faceName*/, int s
                        size, 1);
     SetFont(f->font, 0x000000);
     f->height = TextRectHeight(m_width, (char *)"Ag", ALIGN_LEFT);
+    f->ascent = f->height * 4 / 5;
+    f->decoration = decoration;
 
     if (fm) {
         fm->height = f->height;
-        fm->ascent = f->height * 4 / 5;
-        fm->descent = f->height - fm->ascent;
+        fm->ascent = f->ascent;
+        fm->descent = f->height - f->ascent;
         fm->x_height = f->height / 2;
         fm->draw_spaces = false;
     }
@@ -93,7 +97,8 @@ void PbHtmlContainer::draw_text(litehtml::uint_ptr /*hdc*/, const char *text,
 {
     PbFont *f = (PbFont *)hFont;
     if (!f || !f->font) return;
-    SetFont(f->font, gray_of(color));
+    int g = gray_of(color);
+    SetFont(f->font, g);
     // Overdraw width: DrawTextRect clips glyphs that do not fit the box,
     // and its internal measurement can be slightly wider than StringWidth,
     // which silently drops the last letter of words. litehtml positions
@@ -102,6 +107,18 @@ void PbHtmlContainer::draw_text(litehtml::uint_ptr /*hdc*/, const char *text,
                  (pos.width > 0 ? pos.width : m_width) + 200,
                  pos.height > 0 ? pos.height : f->height, (char *)text,
                  ALIGN_LEFT | VALIGN_TOP);
+
+    // litehtml delegates text-decoration to the container: paint
+    // underlines (links) and line-throughs ourselves per run.
+    if (f->decoration & (litehtml::font_decoration_underline |
+                         litehtml::font_decoration_linethrough)) {
+        int run_w = StringWidth((char *)text);
+        int y = pos.y + m_offset_y;
+        if (f->decoration & litehtml::font_decoration_underline)
+            FillArea(pos.x, y + f->ascent + 4, run_w, 2, g);
+        if (f->decoration & litehtml::font_decoration_linethrough)
+            FillArea(pos.x, y + f->ascent * 2 / 3, run_w, 2, g);
+    }
 }
 
 int PbHtmlContainer::pt_to_px(int pt) const
