@@ -8,6 +8,10 @@
 
 typedef struct ibitmap_s ibitmap;
 
+// Decode an image file (JPEG/PNG/GIF/BMP via stb_image) to an 8-bit
+// grayscale ibitmap, area-averaged to fit max_w x max_h. NULL on failure.
+ibitmap *pb_decode_gray_bitmap(const char *path, int max_w, int max_h);
+
 // Resolves an image src URL to a local file path (fetching/caching as
 // needed). Returns false if the image is unavailable.
 typedef bool (*PbImageResolver)(const char *src, char *path_out, int path_cap);

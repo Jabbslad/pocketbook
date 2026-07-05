@@ -264,6 +264,9 @@ Article added_articles[MAX_FEEDS] = {
 };
 char feed_name_buffers[MAX_FEEDS][80];
 char feed_url_buffers[MAX_FEEDS][160];
+char feed_icon_urls[MAX_FEEDS][256];   // resolved icon source per feed
+ibitmap *feed_icons[MAX_FEEDS];        // decoded tiles, lazy
+bool feed_icon_failed[MAX_FEEDS];      // per-session negative cache
 char keyboard_buffer[160];
 int keyboard_feed_idx = -1;
 int keyboard_mode = 0; // 1 name, 2 URL
@@ -924,6 +927,31 @@ void draw_scrollbar(int top, int view_h, int total, int offset)
 // Pinned virtual rows at the top of the feed list.
 const int PINNED_ROWS = 2;  // 0 = Starred Articles, 1 = All Articles
 
+ibitmap *feed_icon_bitmap(int idx);
+
+// 88px icon tile with a black border; contents centered.
+void draw_icon_tile_frame(int x, int y)
+{
+    const int T = 88;
+    FillArea(x, y, T, 2, C_BLACK);
+    FillArea(x, y + T - 2, T, 2, C_BLACK);
+    FillArea(x, y, 2, T, C_BLACK);
+    FillArea(x + T - 2, y, 2, T, C_BLACK);
+}
+
+void draw_monogram_tile(int x, int y, const char *name)
+{
+    draw_icon_tile_frame(x, y);
+    char letter[2] = {'#', 0};
+    for (const char *p = name; *p; ++p) {
+        if (isalnum((unsigned char)*p)) {
+            letter[0] = (char)toupper((unsigned char)*p);
+            break;
+        }
+    }
+    text(f_h2_b, x, y + 8, 88, 72, letter, ALIGN_CENTER | VALIGN_MIDDLE);
+}
+
 void pinned_row_stats(int which, int *count, bool *has_unread,
                       const char **latest_title)
 {
@@ -961,10 +989,20 @@ void draw_pinned_feed_row(int which, int y, int w, char *buf, int buf_cap)
     const char *latest;
     pinned_row_stats(which, &count, &has_unread, &latest);
 
-    text(has_unread ? f_row_b : f_row, PAD, y + 26, w - PAD * 2 - 180, 52,
+    int tile_y = y + (FEED_ROW_H - 88) / 2 - 1;
+    draw_icon_tile_frame(PAD, tile_y);
+    if (which == 0) {
+        draw_star(PAD + 44, tile_y + 44, 26, true);
+    } else {
+        for (int i = 0; i < 3; ++i)
+            FillArea(PAD + 22, tile_y + 26 + i * 16, 44, 6, C_BLACK);
+    }
+
+    int tx = PAD + 88 + 24;
+    text(has_unread ? f_row_b : f_row, tx, y + 26, w - tx - PAD - 180, 52,
          which == 0 ? "Starred Articles" : "All Articles",
          ALIGN_LEFT | VALIGN_TOP | DOTS);
-    text(f_meta_i, PAD, y + 86, w - PAD * 2 - 180, 36,
+    text(f_meta_i, tx, y + 86, w - tx - PAD - 180, 36,
          latest, ALIGN_LEFT | VALIGN_TOP | DOTS);
     if (count > 0) {
         snprintf(buf, buf_cap, "%d", count);
@@ -977,12 +1015,25 @@ void draw_pinned_feed_row(int which, int y, int w, char *buf, int buf_cap)
     rule(PAD, y + FEED_ROW_H - 2, w - PAD * 2, 2, C_RULE);
 }
 
-void draw_feed_row(const Feed &f, int y, int w, char *buf, int buf_cap)
+void draw_feed_row(int fidx, int y, int w, char *buf, int buf_cap)
 {
+    const Feed &f = feeds[fidx];
     int unread = feed_unread(f);
-    text(unread > 0 ? f_row_b : f_row, PAD, y + 26, w - PAD * 2 - 180, 52,
+
+    int tile_y = y + (FEED_ROW_H - 88) / 2 - 1;
+    ibitmap *icon = feed_icon_bitmap(fidx);
+    if (icon) {
+        draw_icon_tile_frame(PAD, tile_y);
+        DrawBitmap(PAD + (88 - icon->width) / 2,
+                   tile_y + (88 - icon->height) / 2, icon);
+    } else {
+        draw_monogram_tile(PAD, tile_y, f.name);
+    }
+
+    int tx = PAD + 88 + 24;
+    text(unread > 0 ? f_row_b : f_row, tx, y + 26, w - tx - PAD - 180, 52,
          f.name, ALIGN_LEFT | VALIGN_TOP | DOTS);
-    text(f_meta_i, PAD, y + 86, w - PAD * 2 - 180, 36,
+    text(f_meta_i, tx, y + 86, w - tx - PAD - 180, 36,
          f.articles[0].title, ALIGN_LEFT | VALIGN_TOP | DOTS);
     if (unread > 0) {
         snprintf(buf, buf_cap, "%d", unread);
@@ -1029,7 +1080,7 @@ void draw_article_row(const Article &a, const char *src_feed, int y, int w,
 void draw_feed_list_row(int idx, int y, int w, char *buf, int buf_cap)
 {
     if (idx < PINNED_ROWS) draw_pinned_feed_row(idx, y, w, buf, buf_cap);
-    else draw_feed_row(feeds[feed_order[idx - PINNED_ROWS]], y, w, buf, buf_cap);
+    else draw_feed_row(feed_order[idx - PINNED_ROWS], y, w, buf, buf_cap);
 }
 
 void draw_feeds()
@@ -1152,8 +1203,30 @@ void draw_articles()
             unread_n = feed_unread(f);
         }
 
-        text(f_h2_b, PAD, 122, w - PAD * 2 - 320, 64, title,
-             ALIGN_LEFT | VALIGN_TOP | DOTS);
+        // Icon tile beside the feed name, matching the feeds screen.
+        int tile_y = 116;
+        if (virt) {
+            draw_icon_tile_frame(PAD, tile_y);
+            if (vfeed_mode == VMODE_STARRED) {
+                draw_star(PAD + 44, tile_y + 44, 26, true);
+            } else {
+                for (int i = 0; i < 3; ++i)
+                    FillArea(PAD + 22, tile_y + 26 + i * 16, 44, 6, C_BLACK);
+            }
+        } else {
+            ibitmap *icon = feed_icon_bitmap(sel_feed);
+            if (icon) {
+                draw_icon_tile_frame(PAD, tile_y);
+                DrawBitmap(PAD + (88 - icon->width) / 2,
+                           tile_y + (88 - icon->height) / 2, icon);
+            } else {
+                draw_monogram_tile(PAD, tile_y, f.name);
+            }
+        }
+
+        int tx = PAD + 88 + 24;
+        text(f_h2_b, tx, tile_y, w - tx - PAD - 320, 88, title,
+             ALIGN_LEFT | VALIGN_MIDDLE | DOTS);
         snprintf(buf, sizeof(buf), "%d unread of %d", unread_n, total_n);
         text(f_meta_i, w - PAD - 320, 168, 320, 36, buf,
              ALIGN_RIGHT | VALIGN_TOP);
@@ -2448,6 +2521,81 @@ bool resolve_article_image(const char *src, char *path_out, int path_cap)
     return ok;
 }
 
+// ---------------------------------------------------------- feed icons ---
+// Source cascade resolved once per sync: feed-declared artwork, then the
+// site's apple-touch-icon.png, else a monogram tile drawn at render time.
+
+const int ICON_TILE = 88;
+
+void reset_feed_icon(int idx)
+{
+    if (feed_icons[idx]) free(feed_icons[idx]);
+    feed_icons[idx] = NULL;
+    feed_icon_failed[idx] = false;
+}
+
+void resolve_feed_icon(int idx, const char *declared)
+{
+    char url[256] = "";
+    if (declared && *declared &&
+        (!strncmp(declared, "http://", 7) || !strncmp(declared, "https://", 8)) &&
+        !strstr(declared, ".ico"))
+        snprintf(url, sizeof(url), "%s", declared);
+
+    if (!url[0]) {
+        // Derive https://host/apple-touch-icon.png from the feed URL.
+        const char *u = feeds[idx].url;
+        const char *scheme_end = strstr(u, "://");
+        if (scheme_end) {
+            const char *host = scheme_end + 3;
+            const char *slash = strchr(host, '/');
+            int host_len = slash ? (int)(slash - host) : (int)strlen(host);
+            snprintf(url, sizeof(url), "%.*s%.*s/apple-touch-icon.png",
+                     (int)(host - u), u, host_len, host);
+        }
+    }
+
+    if (strcmp(feed_icon_urls[idx], url) != 0 || !feed_icons[idx]) {
+        snprintf(feed_icon_urls[idx], sizeof(feed_icon_urls[idx]), "%s", url);
+        reset_feed_icon(idx);
+    }
+    if (url[0]) {
+        char path[512];
+        resolve_article_image(url, path, sizeof(path));  // prefetch to cache
+    }
+}
+
+ibitmap *feed_icon_bitmap(int idx)
+{
+    if (feed_icons[idx]) return feed_icons[idx];
+    if (feed_icon_failed[idx] || !feed_icon_urls[idx][0]) return NULL;
+
+    char path[512];
+    if (resolve_article_image(feed_icon_urls[idx], path, sizeof(path))) {
+        ibitmap *bmp = pb_decode_gray_bitmap(path, ICON_TILE - 8,
+                                             ICON_TILE - 8);
+        if (bmp) {
+            // Reject useless icons: placeholder stubs (e.g. nasa.gov serves
+            // a 1x1 PNG at /apple-touch-icon.png) and near-blank images.
+            bool ok = bmp->width >= 24 && bmp->height >= 24;
+            if (ok) {
+                unsigned char lo = 255, hi = 0;
+                for (int y = 0; y < bmp->height; ++y)
+                    for (int x = 0; x < bmp->width; ++x) {
+                        unsigned char v = bmp->data[y * bmp->scanline + x];
+                        if (v < lo) lo = v;
+                        if (v > hi) hi = v;
+                    }
+                ok = hi - lo >= 24;
+            }
+            if (ok) feed_icons[idx] = bmp;
+            else free(bmp);
+        }
+    }
+    if (!feed_icons[idx]) feed_icon_failed[idx] = true;
+    return feed_icons[idx];
+}
+
 void prune_image_cache()
 {
     DIR *d = opendir(IMAGE_CACHE_DIR);
@@ -2652,14 +2800,18 @@ void commit_feed_item(FeedArticleStore &store, int *count,
                                     parse_feed_date(date), store.raws[idx]};
 }
 
-int parse_feed_xml(int feed_idx, const char *xml, int len)
+int parse_feed_xml(int feed_idx, const char *xml, int len, char *icon_out,
+                   int icon_cap)
 {
     FeedArticleStore &store = fetched_feed_store[feed_idx];
     xmlTextReaderPtr reader = xmlReaderForMemory(xml, len, feeds[feed_idx].url,
                                                  NULL, XML_PARSE_RECOVER | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    if (icon_out && icon_cap > 0) icon_out[0] = 0;
     if (!reader) return 0;
 
     bool in_item = false;
+    bool in_channel_image = false;  // RSS <channel><image>
+    bool in_icon_field = false;     // capturing channel icon text
     int current_field = 0;
     int field_depth = 0;
     int count = 0;
@@ -2678,8 +2830,16 @@ int parse_feed_xml(int feed_idx, const char *xml, int len)
         if (type == XML_READER_TYPE_ELEMENT) {
             if (!strcmp(name, "item") || !strcmp(name, "entry")) {
                 in_item = true;
+                in_icon_field = false;
                 current_field = 0;
                 title[0] = link[0] = date[0] = desc[0] = 0;
+            } else if (!in_item && icon_out) {
+                // Channel artwork: RSS <image><url>, Atom <logo>/<icon>.
+                if (!strcmp(name, "image")) in_channel_image = true;
+                in_icon_field =
+                    (in_channel_image && !strcmp(name, "url")) ||
+                    !strcmp(name, "logo") ||
+                    (!strcmp(name, "icon") && !in_channel_image);
             } else if (in_item) {
                 if (!strcmp(name, "link")) {
                     xmlChar *href = xmlTextReaderGetAttribute(reader, (const xmlChar *)"href");
@@ -2689,6 +2849,11 @@ int parse_feed_xml(int feed_idx, const char *xml, int len)
                 current_field = field_for_name(name);
                 if (current_field) field_depth = depth;
             }
+        } else if ((type == XML_READER_TYPE_TEXT ||
+                    type == XML_READER_TYPE_CDATA) &&
+                   !in_item && in_icon_field && icon_out && !icon_out[0]) {
+            const xmlChar *value = xmlTextReaderConstValue(reader);
+            if (value) copy_trimmed(icon_out, icon_cap, (const char *)value);
         } else if ((type == XML_READER_TYPE_TEXT || type == XML_READER_TYPE_CDATA ||
                     type == XML_READER_TYPE_SIGNIFICANT_WHITESPACE) && in_item && current_field) {
             const xmlChar *value = xmlTextReaderConstValue(reader);
@@ -2699,6 +2864,10 @@ int parse_feed_xml(int feed_idx, const char *xml, int len)
                 else if (current_field == 4) append_field(desc, sizeof(desc), (const char *)value);
             }
         } else if (type == XML_READER_TYPE_END_ELEMENT) {
+            if (!in_item) {
+                if (!strcmp(name, "image")) in_channel_image = false;
+                in_icon_field = false;
+            }
             if (in_item && (!strcmp(name, "item") || !strcmp(name, "entry"))) {
                 commit_feed_item(store, &count, title, link, date, desc);
                 in_item = false;
@@ -2712,6 +2881,8 @@ int parse_feed_xml(int feed_idx, const char *xml, int len)
     xmlFreeTextReader(reader);
     return count;
 }
+
+void resolve_feed_icon(int idx, const char *declared);
 
 bool refresh_one_feed(int idx, char *scratch, char *error, int error_cap)
 {
@@ -2731,11 +2902,14 @@ bool refresh_one_feed(int idx, char *scratch, char *error, int error_cap)
         old_saved[j] = saved[idx][j];
     }
 
-    int parsed = parse_feed_xml(idx, scratch, (int)strlen(scratch));
+    char declared_icon[256];
+    int parsed = parse_feed_xml(idx, scratch, (int)strlen(scratch),
+                                declared_icon, sizeof(declared_icon));
     if (parsed <= 0) {
         snprintf(error, error_cap, "no articles parsed");
         return false;
     }
+    resolve_feed_icon(idx, declared_icon);
 
     Article *arts = fetched_feed_store[idx].articles;
     memset(saved[idx], 0, sizeof(saved[idx]));
@@ -2812,6 +2986,8 @@ void ensure_schema(sqlite3 *db)
                  NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE articles ADD COLUMN raw TEXT DEFAULT ''",
                  NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE feeds ADD COLUMN icon TEXT DEFAULT ''",
+                 NULL, NULL, NULL);
 }
 
 void save_state()
@@ -2855,12 +3031,13 @@ void save_state()
     }
 
     if (ok && sqlite3_prepare_v2(db,
-            "INSERT INTO feeds VALUES(?1,?2,?3)", -1, &st, NULL) == SQLITE_OK) {
+            "INSERT INTO feeds VALUES(?1,?2,?3,?4)", -1, &st, NULL) == SQLITE_OK) {
         for (int i = 0; ok && i < feed_count; ++i) {
             sqlite3_reset(st);
             sqlite3_bind_int(st, 1, i);
             sqlite3_bind_text(st, 2, feeds[i].name, -1, SQLITE_STATIC);
             sqlite3_bind_text(st, 3, feeds[i].url, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 4, feed_icon_urls[i], -1, SQLITE_STATIC);
             ok = sqlite3_step(st) == SQLITE_DONE;
         }
         sqlite3_finalize(st);
@@ -2940,7 +3117,8 @@ bool load_state()
     }
 
     int fc = 0;
-    if (sqlite3_prepare_v2(db, "SELECT idx,name,url FROM feeds ORDER BY idx",
+    if (sqlite3_prepare_v2(db,
+                           "SELECT idx,name,url,icon FROM feeds ORDER BY idx",
                            -1, &st, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return false;
@@ -2948,10 +3126,13 @@ bool load_state()
     while (sqlite3_step(st) == SQLITE_ROW && fc < MAX_FEEDS) {
         const unsigned char *name = sqlite3_column_text(st, 1);
         const unsigned char *url = sqlite3_column_text(st, 2);
+        const unsigned char *icon = sqlite3_column_text(st, 3);
         snprintf(feed_name_buffers[fc], sizeof(feed_name_buffers[fc]),
                  "%s", name ? (const char *)name : "Feed");
         snprintf(feed_url_buffers[fc], sizeof(feed_url_buffers[fc]),
                  "%s", url ? (const char *)url : "");
+        snprintf(feed_icon_urls[fc], sizeof(feed_icon_urls[fc]),
+                 "%s", icon ? (const char *)icon : "");
         fc++;
     }
     sqlite3_finalize(st);
@@ -3170,6 +3351,10 @@ void add_feed()
     }
 
     int idx = feed_count++;
+    feed_icon_urls[idx][0] = 0;
+    if (feed_icons[idx]) free(feed_icons[idx]);
+    feed_icons[idx] = NULL;
+    feed_icon_failed[idx] = false;
     snprintf(feed_name_buffers[idx], sizeof(feed_name_buffers[idx]), "New feed");
     snprintf(feed_url_buffers[idx], sizeof(feed_url_buffers[idx]),
              "https://example.com/feed.xml");
@@ -3191,6 +3376,7 @@ void delete_feed(int idx)
         return;
     }
 
+    if (feed_icons[idx]) free(feed_icons[idx]);
     for (int i = idx; i + 1 < feed_count; ++i) {
         feeds[i] = feeds[i + 1];
         snprintf(feed_name_buffers[i], sizeof(feed_name_buffers[i]),
@@ -3200,7 +3386,14 @@ void delete_feed(int idx)
         feeds[i].name = feed_name_buffers[i];
         feeds[i].url = feed_url_buffers[i];
         memcpy(saved[i], saved[i + 1], sizeof(saved[i]));
+        snprintf(feed_icon_urls[i], sizeof(feed_icon_urls[i]),
+                 "%s", feed_icon_urls[i + 1]);
+        feed_icons[i] = feed_icons[i + 1];
+        feed_icon_failed[i] = feed_icon_failed[i + 1];
     }
+    feed_icons[feed_count - 1] = NULL;
+    feed_icon_urls[feed_count - 1][0] = 0;
+    feed_icon_failed[feed_count - 1] = false;
     feed_count--;
     if (editing_feed_idx >= feed_count) editing_feed_idx = feed_count - 1;
     if (sel_feed >= feed_count) sel_feed = feed_count - 1;

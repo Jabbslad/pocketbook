@@ -44,6 +44,68 @@ const char *face_for(int weight, bool italic)
 
 } // namespace
 
+// Decode with stb_image (handles progressive JPEG, PNG, GIF, BMP
+// deterministically — InkView's LoadJPEG rendered black rectangles for
+// progressive JPEGs) and box-filter to an 8-bit grayscale ibitmap.
+ibitmap *pb_decode_gray_bitmap(const char *path, int max_w, int max_h)
+{
+    int sw = 0, sh = 0, comp = 0;
+    // Gray + alpha, composited over white: transparent-background logos
+    // would otherwise decode on an undefined background.
+    unsigned char *ga = stbi_load(path, &sw, &sh, &comp, 2);
+    if (!ga || sw <= 0 || sh <= 0) {
+        if (ga) stbi_image_free(ga);
+        return NULL;
+    }
+    unsigned char *gray = (unsigned char *)malloc((size_t)sw * sh);
+    if (!gray) {
+        stbi_image_free(ga);
+        return NULL;
+    }
+    for (size_t i = 0; i < (size_t)sw * sh; ++i) {
+        unsigned g = ga[i * 2];
+        unsigned a = ga[i * 2 + 1];
+        gray[i] = (unsigned char)((g * a + 255u * (255u - a)) / 255u);
+    }
+    stbi_image_free(ga);
+
+    int dw = sw > max_w ? max_w : sw;
+    int dh = (int)((long long)sh * dw / sw);
+    if (dh < 1) dh = 1;
+    if (dh > max_h) {
+        dw = (int)((long long)dw * max_h / dh);
+        if (dw < 1) dw = 1;
+        dh = max_h;
+    }
+
+    int scanline = (dw + 3) & ~3;
+    ibitmap *bmp = (ibitmap *)malloc(sizeof(ibitmap) + (size_t)scanline * dh);
+    if (bmp) {
+        bmp->width = (unsigned short)dw;
+        bmp->height = (unsigned short)dh;
+        bmp->depth = 8;
+        bmp->scanline = (unsigned short)scanline;
+        for (int y = 0; y < dh; ++y) {
+            int sy0 = (int)((long long)y * sh / dh);
+            int sy1 = (int)((long long)(y + 1) * sh / dh);
+            if (sy1 <= sy0) sy1 = sy0 + 1;
+            for (int x = 0; x < dw; ++x) {
+                int sx0 = (int)((long long)x * sw / dw);
+                int sx1 = (int)((long long)(x + 1) * sw / dw);
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+                long sum = 0;
+                for (int yy = sy0; yy < sy1; ++yy)
+                    for (int xx = sx0; xx < sx1; ++xx)
+                        sum += gray[(size_t)yy * sw + xx];
+                bmp->data[(size_t)y * scanline + x] =
+                    (unsigned char)(sum / ((sy1 - sy0) * (sx1 - sx0)));
+            }
+        }
+    }
+    free(gray);
+    return bmp;
+}
+
 PbHtmlContainer::PbHtmlContainer(int width, int default_font_px)
     : m_width(width), m_default_font_px(default_font_px)
 {
@@ -175,52 +237,8 @@ void PbHtmlContainer::load_image(const char *src, const char * /*baseurl*/,
 
     ibitmap *bmp = NULL;
     char path[512];
-    if (m_resolver(src, path, sizeof(path))) {
-        // Decode with stb_image (handles progressive JPEG, PNG, GIF, BMP
-        // deterministically — InkView's LoadJPEG rendered black rectangles
-        // for progressive JPEGs) and box-filter to the content column as
-        // an 8-bit grayscale ibitmap.
-        int sw = 0, sh = 0, comp = 0;
-        unsigned char *gray = stbi_load(path, &sw, &sh, &comp, 1);
-        if (gray && sw > 0 && sh > 0) {
-            int dw = sw > m_width ? m_width : sw;
-            int dh = (int)((long long)sh * dw / sw);
-            if (dh < 1) dh = 1;
-            int max_h = m_view_height * 2;
-            if (dh > max_h) {
-                dw = (int)((long long)dw * max_h / dh);
-                if (dw < 1) dw = 1;
-                dh = max_h;
-            }
-
-            int scanline = (dw + 3) & ~3;
-            bmp = (ibitmap *)malloc(sizeof(ibitmap) + (size_t)scanline * dh);
-            if (bmp) {
-                bmp->width = (unsigned short)dw;
-                bmp->height = (unsigned short)dh;
-                bmp->depth = 8;
-                bmp->scanline = (unsigned short)scanline;
-                // Area-average downscale for photo quality on e-ink.
-                for (int y = 0; y < dh; ++y) {
-                    int sy0 = (int)((long long)y * sh / dh);
-                    int sy1 = (int)((long long)(y + 1) * sh / dh);
-                    if (sy1 <= sy0) sy1 = sy0 + 1;
-                    for (int x = 0; x < dw; ++x) {
-                        int sx0 = (int)((long long)x * sw / dw);
-                        int sx1 = (int)((long long)(x + 1) * sw / dw);
-                        if (sx1 <= sx0) sx1 = sx0 + 1;
-                        long sum = 0;
-                        for (int yy = sy0; yy < sy1; ++yy)
-                            for (int xx = sx0; xx < sx1; ++xx)
-                                sum += gray[(size_t)yy * sw + xx];
-                        bmp->data[(size_t)y * scanline + x] =
-                            (unsigned char)(sum / ((sy1 - sy0) * (sx1 - sx0)));
-                    }
-                }
-            }
-        }
-        if (gray) stbi_image_free(gray);
-    }
+    if (m_resolver(src, path, sizeof(path)))
+        bmp = pb_decode_gray_bitmap(path, m_width, m_view_height * 2);
     m_images[key] = bmp;  // NULL too: negative-cache failed loads
 }
 
