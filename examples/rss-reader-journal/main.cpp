@@ -1865,6 +1865,36 @@ bool ensure_network_connected()
     return rc == NET_OK;
 }
 
+// Draws a non-modal sync progress bar in the footer strip, matching the
+// Journal design: 2px rule, italic status line, black outlined bar.
+void draw_sync_progress(int done, int total, const char *name)
+{
+    int w = ScreenWidth();
+    int h = ScreenHeight();
+    int top = h - LIST_FOOTER_H;
+    char buf[160];
+
+    FillArea(0, top - 2, w, LIST_FOOTER_H + 2, C_WHITE);
+    rule(PAD, top - 2, w - PAD * 2, 2);
+
+    snprintf(buf, sizeof(buf), "Syncing %d of %d \xC2\xB7 %s",
+             done + 1, total, name);
+    text(f_i30, PAD, top + 14, w - PAD * 2, 36, buf,
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+
+    int bar_y = top + 68;
+    int bar_h = 28;
+    int bar_w = w - PAD * 2;
+    rule(PAD, bar_y, bar_w, 2);
+    rule(PAD, bar_y + bar_h - 2, bar_w, 2);
+    FillArea(PAD, bar_y, 2, bar_h, C_BLACK);
+    FillArea(PAD + bar_w - 2, bar_y, 2, bar_h, C_BLACK);
+    int fill = (bar_w - 12) * done / (total > 0 ? total : 1);
+    if (fill > 0) FillArea(PAD + 6, bar_y + 6, fill, bar_h - 12, C_BLACK);
+
+    PartialUpdateBW(0, top - 2, w, LIST_FOOTER_H + 2);
+}
+
 void refresh_all_feeds()
 {
     write_sync_log("--- sync start ---");
@@ -1880,14 +1910,11 @@ void refresh_all_feeds()
         return;
     }
 
-    ShowHourglass();
-    OpenProgressbar(ICON_INFORMATION, "Sync now", "Fetching feeds", 0, NULL);
     int ok = 0;
     char error[96] = "";
     char status[240];
     for (int i = 0; i < feed_count; ++i) {
-        snprintf(status, sizeof(status), "%s", feeds[i].name);
-        UpdateProgressbar(status, (i * 100) / feed_count);
+        draw_sync_progress(i, feed_count, feeds[i].name);
         error[0] = 0;
         if (refresh_one_feed(i, scratch, error, sizeof(error))) {
             ok++;
@@ -1899,8 +1926,6 @@ void refresh_all_feeds()
         }
         write_sync_log(status);
     }
-    CloseProgressbar();
-    HideHourglass();
     free(scratch);
 
     time_t t = time(0);
