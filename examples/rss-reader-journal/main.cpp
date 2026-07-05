@@ -8,6 +8,7 @@
 #include "inkview.h"
 
 #include <curl/curl.h>
+#include <libxml/HTMLparser.h>
 #include <libxml/xmlreader.h>
 #include <sqlite3.h>
 
@@ -29,6 +30,7 @@ namespace {
 
 const int C_BLACK = 0x000000;
 const int C_WHITE = 0xFFFFFF;
+const int C_RULE = 0xAAAAAA;  // light gray row separators, easier on the eye
 
 const int PB_KEY_OK = 0x0a;
 const int PB_KEY_UP = 0x11;
@@ -111,6 +113,7 @@ struct Article {
     const char *meta;  // "Today 07:15 · 9 min read"
     bool unread;
     const char *body;  // paragraphs separated by '\n'
+    time_t when;       // publication time (UTC), 0 if unknown
 };
 
 const char *BODY_FEATURED =
@@ -316,6 +319,30 @@ int page_start[MAX_PAGES + 1];
 int read_pages = 1;
 int read_body_top = 0;  // body y on page 1 (below title block)
 
+// Scrollable list mode (Settings > List view): feeds and article lists
+// scroll with touch instead of paginating.
+bool list_scroll_mode = false;
+int feed_scroll = 0, feed_max_scroll = 0;
+int art_scroll = 0, art_max_scroll = 0;
+
+// Scrollable reading mode (Settings > Article view).
+bool scroll_mode = false;
+int read_scroll = 0;       // pixel offset into the article content
+int read_max_scroll = 0;   // computed at draw time
+int read_scroll_step = 0;  // computed at draw time
+
+// Finger-drag scrolling state.
+int drag_start_y = 0;
+int drag_start_scroll = 0;
+int drag_last_drawn = 0;
+bool drag_active = false;
+bool fast_update_hint = false;  // draw with a flash-free update during drags
+
+// Prev-button hold detection in scrollable reading mode.
+long long prev_key_down_ms = 0;
+bool prev_key_hold_done = false;
+bool swallow_prev_release = false;
+
 // Touch zones, recomputed at draw time.
 struct Zone { int x, y, w, h; };
 bool hit(const Zone &z, int x, int y)
@@ -324,7 +351,8 @@ bool hit(const Zone &z, int x, int y)
 }
 Zone z_sync, z_settings, z_back;
 Zone z_save, z_aa, z_next_article;
-Zone z_settings_feeds, z_settings_diagnostics, z_add_feed;
+Zone z_settings_feeds, z_settings_scrollmode, z_settings_listscroll,
+     z_settings_diagnostics, z_add_feed;
 Zone z_feed_edit[LIST_ROWS], z_feed_delete[LIST_ROWS];
 Zone z_feed_name, z_feed_url, z_feed_editor_delete;
 const int MAX_LINK_ZONES = 12;
@@ -366,6 +394,47 @@ int feed_settings_pages()
     return (feed_count + LIST_ROWS - 1) / LIST_ROWS;
 }
 
+// Feed list display order: feeds with unread articles first (most recent
+// unread article first), then fully-read feeds (most recent article first),
+// ties resolved alphabetically. feeds[] itself is never reordered because
+// saved[], the article stores and name buffers are indexed by position.
+int feed_order[MAX_FEEDS];
+
+time_t feed_recency(const Feed &f, bool unread_only)
+{
+    time_t best = 0;
+    for (int j = 0; j < f.count; ++j) {
+        if (unread_only && !f.articles[j].unread) continue;
+        if (f.articles[j].when > best) best = f.articles[j].when;
+    }
+    return best;
+}
+
+bool feed_before(int a, int b)
+{
+    bool ua = feed_unread(feeds[a]) > 0;
+    bool ub = feed_unread(feeds[b]) > 0;
+    if (ua != ub) return ua;
+    time_t ta = feed_recency(feeds[a], ua);
+    time_t tb = feed_recency(feeds[b], ub);
+    if (ta != tb) return ta > tb;
+    return strcasecmp(feeds[a].name, feeds[b].name) < 0;
+}
+
+void compute_feed_order()
+{
+    for (int i = 0; i < feed_count; ++i) feed_order[i] = i;
+    for (int i = 1; i < feed_count; ++i) {
+        int v = feed_order[i];
+        int j = i - 1;
+        while (j >= 0 && feed_before(v, feed_order[j])) {
+            feed_order[j + 1] = feed_order[j];
+            j--;
+        }
+        feed_order[j + 1] = v;
+    }
+}
+
 void refresh_date()
 {
     static const char *wday[] = {"Sunday", "Monday", "Tuesday", "Wednesday",
@@ -388,9 +457,9 @@ void text(ifont *font, int x, int y, int w, int h, const char *value, int flags)
     DrawTextRect(x, y, w, h, (char *)value, flags);
 }
 
-void rule(int x, int y, int w, int thickness)
+void rule(int x, int y, int w, int thickness, int color = C_BLACK)
 {
-    FillArea(x, y, w, thickness, C_BLACK);
+    FillArea(x, y, w, thickness, color);
 }
 
 const char *view_name()
@@ -700,7 +769,7 @@ void paginate_article()
 
 // -------------------------------------------------------------- screens ---
 
-void draw_list_footer(int page, int pages, const char *hint)
+void draw_list_footer(int page, int pages)
 {
     int w = ScreenWidth();
     int h = ScreenHeight();
@@ -713,10 +782,60 @@ void draw_list_footer(int page, int pages, const char *hint)
     text(f_nav, w - PAD - 8 - 300, top, 300, LIST_FOOTER_H,
          "next \xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
     snprintf(buf, sizeof(buf), "%d / %d", page + 1, pages);
-    text(f_pager_b, w / 2 - 200, top + 25, 400, 36, buf,
+    text(f_pager_b, w / 2 - 200, top, 400, LIST_FOOTER_H, buf,
          ALIGN_CENTER | VALIGN_MIDDLE);
-    text(f_hint_i, w / 2 - 300, top + 65, 600, 32, hint,
-         ALIGN_CENTER | VALIGN_MIDDLE);
+}
+
+// Thin right-edge scrollbar shown in scrollable list mode when there is
+// more content than fits: light track, black thumb sized proportionally.
+void draw_scrollbar(int top, int view_h, int total, int offset)
+{
+    if (total <= view_h) return;
+    int w = ScreenWidth();
+    int x = w - 10;
+    FillArea(x, top, 4, view_h, C_RULE);
+    int thumb_h = (int)((long long)view_h * view_h / total);
+    if (thumb_h < 48) thumb_h = 48;
+    int max_off = total - view_h;
+    int thumb_y = top + (int)((long long)(view_h - thumb_h) * offset / max_off);
+    FillArea(x, thumb_y, 4, thumb_h, C_BLACK);
+}
+
+void draw_feed_row(const Feed &f, int y, int w, char *buf, int buf_cap)
+{
+    int unread = feed_unread(f);
+    text(unread > 0 ? f_row_b : f_row, PAD, y + 26, w - PAD * 2 - 180, 52,
+         f.name, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 86, w - PAD * 2 - 180, 36,
+         f.articles[0].title, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    if (unread > 0) {
+        snprintf(buf, buf_cap, "%d", unread);
+        text(f_40_b, w - PAD - 160, y, 160, FEED_ROW_H, buf,
+             ALIGN_RIGHT | VALIGN_MIDDLE);
+    } else {
+        text(f_40, w - PAD - 160, y, 160, FEED_ROW_H,
+             "\xE2\x80\x94", ALIGN_RIGHT | VALIGN_MIDDLE);
+    }
+    rule(PAD, y + FEED_ROW_H - 2, w - PAD * 2, 2, C_RULE);
+}
+
+void draw_article_row(const Article &a, int y, int w, char *buf, int buf_cap)
+{
+    // Unread marker: filled dot; read: ring.
+    if (a.unread) {
+        fill_disc(PAD + 11, y + 59, 11, C_BLACK);
+    } else {
+        fill_disc(PAD + 11, y + 59, 11, C_BLACK);
+        fill_disc(PAD + 11, y + 59, 8, C_WHITE);
+    }
+
+    int tx = PAD + 22 + 30;
+    text(a.unread ? f_40_b : f_40, tx, y + 32, w - PAD - tx, 52,
+         a.title, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    snprintf(buf, buf_cap, "%s%s", a.meta, a.unread ? "" : " \xC2\xB7 read");
+    text(f_meta_i, tx, y + 92, w - PAD - tx, 36, buf,
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2, C_RULE);
 }
 
 void draw_feeds()
@@ -760,31 +879,37 @@ void draw_feeds()
 
     rule(PAD, 222, w - PAD * 2, 6);
 
-    // Feed rows.
-    for (int i = 0; i < LIST_ROWS; ++i) {
-        int idx = feed_page * LIST_ROWS + i;
-        if (idx >= feed_count) break;
-        const Feed &f = feeds[idx];
-        int unread = feed_unread(f);
-        int y = 228 + i * FEED_ROW_H;
+    // Feed rows, in display order.
+    compute_feed_order();
+    if (list_scroll_mode) {
+        int top = 228;
+        int h = ScreenHeight();
+        int view_h = h - top;
+        int total = feed_count * FEED_ROW_H;
+        feed_max_scroll = total - view_h;
+        if (feed_max_scroll < 0) feed_max_scroll = 0;
+        if (feed_scroll > feed_max_scroll) feed_scroll = feed_max_scroll;
+        if (feed_scroll < 0) feed_scroll = 0;
 
-        text(unread > 0 ? f_row_b : f_row, PAD, y + 26, w - PAD * 2 - 180, 52,
-             f.name, ALIGN_LEFT | VALIGN_TOP | DOTS);
-        text(f_meta_i, PAD, y + 86, w - PAD * 2 - 180, 36,
-             f.articles[0].title, ALIGN_LEFT | VALIGN_TOP | DOTS);
-        if (unread > 0) {
-            snprintf(buf, sizeof(buf), "%d", unread);
-            text(f_40_b, w - PAD - 160, y, 160, FEED_ROW_H, buf,
-                 ALIGN_RIGHT | VALIGN_MIDDLE);
-        } else {
-            text(f_40, w - PAD - 160, y, 160, FEED_ROW_H,
-                 "\xE2\x80\x94", ALIGN_RIGHT | VALIGN_MIDDLE);
+        SetClip(0, top, w, view_h);
+        for (int idx = 0; idx < feed_count; ++idx) {
+            int y = top - feed_scroll + idx * FEED_ROW_H;
+            if (y + FEED_ROW_H <= top || y >= h) continue;
+            draw_feed_row(feeds[feed_order[idx]], y, w, buf, sizeof(buf));
         }
-        rule(PAD, y + FEED_ROW_H - 2, w - PAD * 2, 2);
+        SetClip(0, 0, w, h);
+        draw_scrollbar(top, view_h, total, feed_scroll);
+    } else {
+        for (int i = 0; i < LIST_ROWS; ++i) {
+            int idx = feed_page * LIST_ROWS + i;
+            if (idx >= feed_count) break;
+            draw_feed_row(feeds[feed_order[idx]], 228 + i * FEED_ROW_H, w,
+                          buf, sizeof(buf));
+        }
+        draw_list_footer(feed_page, feed_pages());
     }
-
-    draw_list_footer(feed_page, feed_pages(), "side buttons turn pages");
-    FullUpdate();
+    if (fast_update_hint) SoftUpdate();
+    else FullUpdate();
 }
 
 void draw_articles()
@@ -805,33 +930,35 @@ void draw_articles()
          ALIGN_RIGHT | VALIGN_TOP);
     rule(PAD, 210, w - PAD * 2, 6);
 
-    for (int i = 0; i < LIST_ROWS; ++i) {
-        int idx = art_page * LIST_ROWS + i;
-        if (idx >= f.count) break;
-        const Article &a = f.articles[idx];
-        int y = 216 + i * ART_ROW_H;
+    if (list_scroll_mode) {
+        int top = 216;
+        int h = ScreenHeight();
+        int view_h = h - top;
+        int total = f.count * ART_ROW_H;
+        art_max_scroll = total - view_h;
+        if (art_max_scroll < 0) art_max_scroll = 0;
+        if (art_scroll > art_max_scroll) art_scroll = art_max_scroll;
+        if (art_scroll < 0) art_scroll = 0;
 
-        // Unread marker: filled dot; read: 3px ring.
-        if (a.unread) {
-            fill_disc(PAD + 11, y + 59, 11, C_BLACK);
-        } else {
-            fill_disc(PAD + 11, y + 59, 11, C_BLACK);
-            fill_disc(PAD + 11, y + 59, 8, C_WHITE);
+        SetClip(0, top, w, view_h);
+        for (int idx = 0; idx < f.count; ++idx) {
+            int y = top - art_scroll + idx * ART_ROW_H;
+            if (y + ART_ROW_H <= top || y >= h) continue;
+            draw_article_row(f.articles[idx], y, w, buf, sizeof(buf));
         }
-
-        int tx = PAD + 22 + 30;
-        text(a.unread ? f_40_b : f_40, tx, y + 32, w - PAD - tx, 52,
-             a.title, ALIGN_LEFT | VALIGN_TOP | DOTS);
-        snprintf(buf, sizeof(buf), "%s%s", a.meta,
-                 a.unread ? "" : " \xC2\xB7 read");
-        text(f_meta_i, tx, y + 92, w - PAD - tx, 36, buf,
-             ALIGN_LEFT | VALIGN_TOP | DOTS);
-        rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+        SetClip(0, 0, w, h);
+        draw_scrollbar(top, view_h, total, art_scroll);
+    } else {
+        for (int i = 0; i < LIST_ROWS; ++i) {
+            int idx = art_page * LIST_ROWS + i;
+            if (idx >= f.count) break;
+            draw_article_row(f.articles[idx], 216 + i * ART_ROW_H, w,
+                             buf, sizeof(buf));
+        }
+        draw_list_footer(art_page, article_pages());
     }
-
-    draw_list_footer(art_page, article_pages(),
-                     "side buttons turn pages \xC2\xB7 tap to open");
-    FullUpdate();
+    if (fast_update_hint) SoftUpdate();
+    else FullUpdate();
 }
 
 void draw_settings()
@@ -858,6 +985,32 @@ void draw_settings()
          "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
     rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
     z_settings_feeds = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40_b, PAD, y + 32, w - PAD * 2 - 320, 52,
+         "Article view", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 92, w - PAD * 2 - 320, 36,
+         scroll_mode ? "Page buttons scroll the article"
+                     : "Page buttons turn whole pages",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 300, y, 300, ART_ROW_H,
+         scroll_mode ? "Scrollable" : "Paginated",
+         ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_settings_scrollmode = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40_b, PAD, y + 32, w - PAD * 2 - 320, 52,
+         "List view", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 92, w - PAD * 2 - 320, 36,
+         list_scroll_mode ? "Feed and article lists scroll with touch"
+                          : "Feed and article lists use pages",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 300, y, 300, ART_ROW_H,
+         list_scroll_mode ? "Scrollable" : "Paginated",
+         ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_settings_listscroll = (Zone){0, y, w, ART_ROW_H};
 
     y += ART_ROW_H;
     text(f_40_b, PAD, y + 32, w - PAD * 2 - 120, 52,
@@ -956,8 +1109,7 @@ void draw_feed_settings()
         rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
     }
 
-    draw_list_footer(feed_settings_page, feed_settings_pages(),
-                     "side buttons scroll feeds");
+    draw_list_footer(feed_settings_page, feed_settings_pages());
     FullUpdate();
 }
 
@@ -1064,7 +1216,137 @@ void draw_feed_editor()
     FullUpdate();
 }
 
-void draw_reading()
+// Shared reading footer: Save | Aa | <center label> | Next article ›
+void draw_reading_footer(const char *center)
+{
+    int w = ScreenWidth();
+    int h = ScreenHeight();
+    int ftop = h - READ_FOOTER_H;
+    rule(0, ftop - 3, w, 3);
+    int cy = ftop + READ_FOOTER_H / 2;
+    bool is_saved = saved[sel_feed][sel_article];
+
+    // Star icon only, equal padding either side of the 36px glyph.
+    const int star_pad = 44;
+    int star_cx = star_pad + 18;
+    draw_star(star_cx, cy, 18, is_saved);
+    int div1 = star_cx + 18 + star_pad;
+    FillArea(div1, ftop, 2, READ_FOOTER_H, C_BLACK);
+    z_save = (Zone){0, ftop, div1, READ_FOOTER_H};
+
+    SetFont(f_ctrl, C_BLACK);
+    int aw = StringWidth((char *)"Aa");
+    text(f_ctrl, div1 + 2 + 32, ftop, aw + 8, READ_FOOTER_H, "Aa",
+         ALIGN_LEFT | VALIGN_MIDDLE);
+    int div2 = div1 + 2 + 32 + aw + 32;
+    FillArea(div2, ftop, 2, READ_FOOTER_H, C_BLACK);
+    z_aa = (Zone){div1, ftop, div2 - div1, READ_FOOTER_H};
+
+    SetFont(f_nav, C_BLACK);
+    int nw = StringWidth((char *)"Next article \xE2\x80\xBA");
+    int ntx = w - 40 - 32 - nw;
+    int div3 = ntx - 32;
+    FillArea(div3, ftop, 2, READ_FOOTER_H, C_BLACK);
+    text(f_nav, ntx, ftop, nw + 8, READ_FOOTER_H, "Next article \xE2\x80\xBA",
+         ALIGN_LEFT | VALIGN_MIDDLE);
+    z_next_article = (Zone){div3, ftop, w - div3, READ_FOOTER_H};
+
+    text(f_i30, div2, ftop, div3 - div2, READ_FOOTER_H, center,
+         ALIGN_CENTER | VALIGN_MIDDLE);
+}
+
+// Scrollable reading mode: the whole article (title + body) is one column
+// moved by a pixel offset; page buttons scroll by nearly a screenful.
+void draw_reading_scrolled()
+{
+    int w = ScreenWidth();
+    int h = ScreenHeight();
+    const Feed &f = feeds[sel_feed];
+    const Article &a = f.articles[sel_article];
+    int cw = w - READ_PAD * 2;
+    char buf[160];
+
+    ClearScreen();
+
+    int top = PAD;
+    int footer_top = h - READ_FOOTER_H - 3;
+    int avail = footer_top - top;
+
+    SetFont(f_title_b, C_BLACK);
+    int th = TextRectHeight(cw, (char *)a.title, ALIGN_LEFT);
+    SetFont(f_body, C_BLACK);
+    int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
+
+    // Total content height: meta + title + rule + body paragraphs.
+    int total = 36 + 18 + th + 24 + 3 + 40;
+    for (int i = 0; i < para_count; ++i) {
+        char url[256];
+        total += (is_link_paragraph(paras[i], url, sizeof(url))
+                      ? line_h
+                      : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT)) +
+                 PARA_GAP;
+    }
+
+    read_max_scroll = total - avail;
+    if (read_max_scroll < 0) read_max_scroll = 0;
+    if (read_scroll > read_max_scroll) read_scroll = read_max_scroll;
+    if (read_scroll < 0) read_scroll = 0;
+    read_scroll_step = avail - line_h;  // keep one line of overlap
+
+    SetClip(0, top, w, avail);
+    int y = top - read_scroll;
+
+    snprintf(buf, sizeof(buf), "%s \xC2\xB7 %s", f.name, a.meta);
+    if (y + 36 > top && y < footer_top)
+        text(f_meta_i, READ_PAD, y, cw, 36, buf, ALIGN_LEFT | VALIGN_TOP);
+    y += 36 + 18;
+
+    if (y + th > top && y < footer_top) {
+        SetFont(f_title_b, C_BLACK);
+        DrawTextRect(READ_PAD, y, cw, th, (char *)a.title,
+                     ALIGN_LEFT | VALIGN_TOP);
+    }
+    y += th + 24;
+    if (y + 3 > top && y < footer_top) rule(READ_PAD, y, cw, 3);
+    y += 3 + 40;
+
+    body_link_zone_count = 0;
+    SetFont(f_body, C_BLACK);
+    for (int i = 0; i < para_count && y < footer_top; ++i) {
+        char url[256];
+        bool is_link = is_link_paragraph(paras[i], url, sizeof(url));
+        int ph = is_link ? line_h
+                         : TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+        if (y + ph > top) {
+            if (is_link) {
+                DrawTextRect(READ_PAD, y, cw, line_h, (char *)paras[i],
+                             ALIGN_LEFT | VALIGN_TOP | DOTS);
+                int underline_w = StringWidth((char *)paras[i]);
+                if (underline_w > cw) underline_w = cw;
+                FillArea(READ_PAD, y + line_h + 2, underline_w, 2, C_BLACK);
+                if (y >= top && y + line_h + 4 <= footer_top)
+                    add_body_link_zone(READ_PAD - 8, y - 8, underline_w + 16,
+                                       line_h + 20, url);
+            } else {
+                DrawTextRect(READ_PAD, y, cw, ph, (char *)paras[i],
+                             ALIGN_LEFT | VALIGN_TOP);
+            }
+        }
+        y += ph + PARA_GAP;
+    }
+    SetClip(0, 0, w, h);
+
+    int pct = total <= avail
+                  ? 100
+                  : (int)(((long)(read_scroll + avail)) * 100 / total);
+    if (pct > 100) pct = 100;
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    draw_reading_footer(buf);
+    if (fast_update_hint) SoftUpdate();
+    else FullUpdate();
+}
+
+void draw_reading_paginated()
 {
     int w = ScreenWidth();
     int h = ScreenHeight();
@@ -1111,45 +1393,15 @@ void draw_reading()
         }
     }
 
-    // Footer bar: Save | Aa | Page n of m | Next article ›
-    int ftop = h - READ_FOOTER_H;
-    rule(0, ftop - 3, w, 3);
-    int cy = ftop + READ_FOOTER_H / 2;
-    bool is_saved = saved[sel_feed][sel_article];
-
-    int x = 40 + 32;
-    draw_star(x + 17, cy, 18, is_saved);
-    SetFont(f_nav, C_BLACK);
-    const char *save_label = is_saved ? "Saved" : "Save";
-    int lw = StringWidth((char *)save_label);
-    text(f_nav, x + 36 + 16, ftop, lw + 8, READ_FOOTER_H, save_label,
-         ALIGN_LEFT | VALIGN_MIDDLE);
-    int div1 = x + 36 + 16 + lw + 32;
-    FillArea(div1, ftop, 2, READ_FOOTER_H, C_BLACK);
-    z_save = (Zone){0, ftop, div1, READ_FOOTER_H};
-
-    SetFont(f_ctrl, C_BLACK);
-    int aw = StringWidth((char *)"Aa");
-    text(f_ctrl, div1 + 2 + 32, ftop, aw + 8, READ_FOOTER_H, "Aa",
-         ALIGN_LEFT | VALIGN_MIDDLE);
-    int div2 = div1 + 2 + 32 + aw + 32;
-    FillArea(div2, ftop, 2, READ_FOOTER_H, C_BLACK);
-    z_aa = (Zone){div1, ftop, div2 - div1, READ_FOOTER_H};
-
-    SetFont(f_nav, C_BLACK);
-    int nw = StringWidth((char *)"Next article \xE2\x80\xBA");
-    int ntx = w - 40 - 32 - nw;
-    int div3 = ntx - 32;
-    FillArea(div3, ftop, 2, READ_FOOTER_H, C_BLACK);
-    text(f_nav, ntx, ftop, nw + 8, READ_FOOTER_H, "Next article \xE2\x80\xBA",
-         ALIGN_LEFT | VALIGN_MIDDLE);
-    z_next_article = (Zone){div3, ftop, w - div3, READ_FOOTER_H};
-
     snprintf(buf, sizeof(buf), "Page %d of %d", read_page + 1, read_pages);
-    text(f_i30, div2, ftop, div3 - div2, READ_FOOTER_H, buf,
-         ALIGN_CENTER | VALIGN_MIDDLE);
-
+    draw_reading_footer(buf);
     FullUpdate();
+}
+
+void draw_reading()
+{
+    if (scroll_mode) draw_reading_scrolled();
+    else draw_reading_paginated();
 }
 
 void draw_screen()
@@ -1171,6 +1423,7 @@ void open_article(int fi, int ai)
     sel_article = ai;
     feeds[fi].articles[ai].unread = false;
     read_page = 0;
+    read_scroll = 0;
     view = VIEW_READING;
     paginate_article();
 }
@@ -1188,10 +1441,12 @@ void previous_article_or_list()
     if (sel_article > 0) {
         open_article(sel_feed, sel_article - 1);
         read_page = read_pages - 1;
+        read_scroll = 1 << 28;  // clamped to the end at draw time
         draw_screen();
     } else {
         view = VIEW_ARTICLES;
         art_page = sel_article / LIST_ROWS;
+        art_scroll = sel_article * ART_ROW_H;
         draw_screen();
     }
 }
@@ -1275,78 +1530,156 @@ void decode_entities(char *s)
     *w = 0;
 }
 
-void copy_href_from_tag(const char *tag, char *out, int cap)
+// ------------------------------------------------ HTML -> text rendering ---
+// Feed bodies are HTML. libxml2's HTML parser handles entities, CDATA,
+// hard-wrapped source lines and malformed markup; we walk the tree and
+// emit plain text: block elements break lines, inline whitespace collapses,
+// anchors become tappable "arrow + URL" rows.
+
+struct HtmlEmit {
+    char *out;
+    int cap;
+    int len;
+    bool pending_break;
+    bool pending_space;
+    // Links collected inside the current block, emitted as tappable rows
+    // after the block so they do not interrupt sentences.
+    char pending_links[4][256];
+    int pending_link_count;
+};
+
+void emit_raw(HtmlEmit *e, char c)
 {
-    out[0] = 0;
-    const char *gt = strchr(tag, '>');
-    if (!gt) return;
-    for (const char *p = tag; p + 5 < gt; ++p) {
-        if (strncasecmp(p, "href", 4)) continue;
-        p += 4;
-        while (p < gt && isspace((unsigned char)*p)) p++;
-        if (p >= gt || *p != '=') continue;
-        p++;
-        while (p < gt && isspace((unsigned char)*p)) p++;
-        char quote = (*p == '\'' || *p == '"') ? *p++ : ' ';
-        const char *stop = p;
-        while (stop < gt && ((quote == ' ' && !isspace((unsigned char)*stop) && *stop != '>') ||
-                             (quote != ' ' && *stop != quote))) stop++;
-        int n = stop - p;
-        if (n >= cap) n = cap - 1;
-        memcpy(out, p, n);
-        out[n] = 0;
-        decode_entities(out);
-        return;
+    if (e->len + 1 < e->cap) e->out[e->len++] = c;
+}
+
+void emit_break(HtmlEmit *e)
+{
+    if (e->len > 0 && e->out[e->len - 1] != '\n') emit_raw(e, '\n');
+    e->pending_break = false;
+    e->pending_space = false;
+}
+
+void emit_text(HtmlEmit *e, const char *s)
+{
+    for (; *s; ++s) {
+        unsigned char c = (unsigned char)*s;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            e->pending_space = true;
+            continue;
+        }
+        if (e->pending_break) emit_break(e);
+        else if (e->pending_space && e->len > 0 && e->out[e->len - 1] != '\n')
+            emit_raw(e, ' ');
+        e->pending_space = false;
+        emit_raw(e, (char)c);
+    }
+}
+
+bool is_block_element(const char *name)
+{
+    static const char *blocks[] = {
+        "p", "div", "li", "ul", "ol", "blockquote", "figure", "figcaption",
+        "table", "tr", "pre", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+        "section", "article", "header", "footer", "aside"
+    };
+    for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i)
+        if (!strcasecmp(name, blocks[i])) return true;
+    return false;
+}
+
+void flush_pending_links(HtmlEmit *e)
+{
+    for (int i = 0; i < e->pending_link_count; ++i) {
+        if (e->len + 8 >= e->cap) break;
+        emit_break(e);
+        const char *prefix = "\xE2\x86\x97 ";
+        for (const char *c = prefix; *c; ++c) emit_raw(e, *c);
+        for (const char *c = e->pending_links[i]; *c; ++c) emit_raw(e, *c);
+        e->pending_break = true;
+    }
+    e->pending_link_count = 0;
+}
+
+void walk_html(HtmlEmit *e, xmlNode *node)
+{
+    for (xmlNode *n = node; n; n = n->next) {
+        if (n->type == XML_TEXT_NODE || n->type == XML_CDATA_SECTION_NODE) {
+            if (n->content) emit_text(e, (const char *)n->content);
+            continue;
+        }
+        if (n->type != XML_ELEMENT_NODE) continue;
+
+        const char *name = (const char *)n->name;
+        if (!strcasecmp(name, "script") || !strcasecmp(name, "style")) continue;
+        if (!strcasecmp(name, "br")) {
+            e->pending_break = true;
+            continue;
+        }
+
+        bool block = is_block_element(name);
+        if (block) e->pending_break = true;
+
+        if (!strcasecmp(name, "a")) {
+            xmlChar *prop = xmlGetProp(n, (const xmlChar *)"href");
+            if (prop) {
+                const char *href = (const char *)prop;
+                bool is_web = !strncmp(href, "http://", 7) ||
+                              !strncmp(href, "https://", 8);
+                bool duplicate = false;
+                for (int i = 0; i < e->pending_link_count; ++i)
+                    if (!strcmp(e->pending_links[i], href)) duplicate = true;
+                if (is_web && !duplicate &&
+                    e->pending_link_count < (int)(sizeof(e->pending_links) /
+                                                  sizeof(e->pending_links[0])))
+                    snprintf(e->pending_links[e->pending_link_count++],
+                             sizeof(e->pending_links[0]), "%s", href);
+                xmlFree(prop);
+            }
+        }
+
+        walk_html(e, n->children);
+
+        if (block) {
+            flush_pending_links(e);
+            e->pending_break = true;
+        }
     }
 }
 
 void strip_markup(char *dst, int cap, const char *src)
 {
-    char tmp[BODY_BUF];
-    int out = 0;
-    char active_href[256] = "";
-    if (!src) src = "";
+    dst[0] = 0;
+    if (!src) return;
 
-    if (!strncmp(src, "<![CDATA[", 9)) src += 9;
-
-    while (*src && out + 1 < (int)sizeof(tmp)) {
-        if (!strncmp(src, "<![CDATA[", 9)) { src += 9; continue; }
-        if (!strncmp(src, "]]>", 3)) { src += 3; continue; }
-        if (!strncmp(src, "[CDATA[", 7)) { src += 7; continue; }
-        if (*src == '<') {
-            if (!strncmp(src, "<![CDATA[", 9)) { src += 9; continue; }
-            const char *tag = src + 1;
-            bool closing = *tag == '/';
-            if (closing) tag++;
-            while (*tag && isspace((unsigned char)*tag)) tag++;
-
-            bool is_anchor = !strncasecmp(tag, "a", 1) &&
-                             (tag[1] == '>' || tag[1] == ' ' || tag[1] == '\t' || tag[1] == '\n');
-            bool block = !strncasecmp(tag, "p", 1) || !strncasecmp(tag, "br", 2) ||
-                         !strncasecmp(tag, "div", 3) || !strncasecmp(tag, "li", 2) ||
-                         !strncasecmp(tag, "tr", 2);
-            if (!closing && is_anchor) {
-                copy_href_from_tag(src, active_href, sizeof(active_href));
-            } else if (closing && is_anchor && active_href[0] && out + 8 < (int)sizeof(tmp)) {
-                if (out > 0 && tmp[out - 1] != '\n') tmp[out++] = '\n';
-                const char *prefix = "\xE2\x86\x97 "; // northeast arrow
-                for (const char *p = prefix; *p && out + 1 < (int)sizeof(tmp); ++p)
-                    tmp[out++] = *p;
-                for (const char *h = active_href; *h && out + 2 < (int)sizeof(tmp); ++h)
-                    tmp[out++] = *h;
-                if (out + 1 < (int)sizeof(tmp)) tmp[out++] = '\n';
-                active_href[0] = 0;
-            }
-            if (block && out > 0 && tmp[out - 1] != '\n') tmp[out++] = '\n';
-            while (*src && *src != '>') src++;
-            if (*src == '>') src++;
-        } else {
-            tmp[out++] = *src++;
-        }
+    // Plain-text bodies (no markup) keep their own line structure.
+    if (!strchr(src, '<')) {
+        char tmp[BODY_BUF];
+        snprintf(tmp, sizeof(tmp), "%s", src);
+        decode_entities(tmp);
+        copy_trimmed(dst, cap, tmp);
+        return;
     }
-    tmp[out] = 0;
-    decode_entities(tmp);
-    copy_trimmed(dst, cap, tmp);
+
+    htmlDocPtr doc = htmlReadMemory(src, (int)strlen(src), NULL, "utf-8",
+                                    HTML_PARSE_RECOVER | HTML_PARSE_NOERROR |
+                                    HTML_PARSE_NOWARNING | HTML_PARSE_NONET);
+    if (!doc) {
+        copy_trimmed(dst, cap, src);
+        return;
+    }
+
+    HtmlEmit e;
+    memset(&e, 0, sizeof(e));
+    e.out = dst;
+    e.cap = cap;
+    walk_html(&e, xmlDocGetRootElement(doc));
+    flush_pending_links(&e);
+    xmlFreeDoc(doc);
+
+    while (e.len > 0 && (dst[e.len - 1] == '\n' || dst[e.len - 1] == ' '))
+        e.len--;
+    dst[e.len] = 0;
 }
 
 struct CurlRuntime {
@@ -1542,14 +1875,136 @@ void append_field(char *dst, int cap, const char *text)
     snprintf(dst + len, cap - len, "%s", text);
 }
 
+// Parse RFC-822 (RSS) and ISO-8601 (Atom) timestamps into UTC time_t.
+// Hand-rolled and locale-independent: strptime %a/%b month and day names
+// depend on the device locale and silently fail on non-English firmware.
+long parse_tz_offset(const char *s)
+{
+    while (*s == ' ') s++;
+    if (*s == '+' || *s == '-') {
+        int sign = *s == '-' ? -1 : 1;
+        int hh = 0, mm = 0;
+        if (sscanf(s + 1, "%2d:%2d", &hh, &mm) == 2 ||
+            sscanf(s + 1, "%2d%2d", &hh, &mm) == 2)
+            return sign * (hh * 3600L + mm * 60);
+    }
+    return 0;  // Z, GMT, UT, named zones: treat as UTC
+}
+
+time_t parse_feed_date(const char *s)
+{
+    if (!s || !*s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+
+    // ISO-8601: 2026-07-04T21:02:43Z / +02:00 / .123Z / bare date.
+    int y, mo, d, hh = 0, mi = 0, ss = 0;
+    int n = sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &hh, &mi, &ss);
+    if (n >= 3) {
+        tm.tm_year = y - 1900;
+        tm.tm_mon = mo - 1;
+        tm.tm_mday = d;
+        tm.tm_hour = hh;
+        tm.tm_min = mi;
+        tm.tm_sec = ss;
+        const char *tz = s;
+        while (*tz && *tz != '+' && *tz != 'Z' &&
+               !(*tz == '-' && tz > s + 8)) tz++;
+        return timegm(&tm) - (n >= 6 ? parse_tz_offset(tz) : 0);
+    }
+
+    // RFC-822: [Sat, ]04 Jul 2026 16:49:14 +0000|GMT
+    const char *p = s;
+    if (isalpha((unsigned char)*p)) {
+        const char *comma = strchr(p, ',');
+        if (!comma || comma - p > 10) return 0;
+        p = comma + 1;
+    }
+    while (*p == ' ') p++;
+    char mon_name[4] = "";
+    if (sscanf(p, "%2d %3s %4d %2d:%2d:%2d", &d, mon_name, &y, &hh, &mi, &ss) < 3)
+        return 0;
+    static const char *months[] = {"jan", "feb", "mar", "apr", "may", "jun",
+                                   "jul", "aug", "sep", "oct", "nov", "dec"};
+    mo = -1;
+    for (int i = 0; i < 12; ++i)
+        if (!strncasecmp(mon_name, months[i], 3)) { mo = i; break; }
+    if (mo < 0) return 0;
+    if (y < 100) y += y < 70 ? 2000 : 1900;
+
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo;
+    tm.tm_mday = d;
+    tm.tm_hour = hh;
+    tm.tm_min = mi;
+    tm.tm_sec = ss;
+
+    const char *tz = strchr(p, ':');  // after first time colon
+    tz = tz ? strchr(tz, ' ') : NULL;
+    return timegm(&tm) - (tz ? parse_tz_offset(tz) : 0);
+}
+
+// Meta line in the Journal style: "Today 07:15 · 9 min read",
+// "Yesterday · 3 min read", "Jul 2 · 11 min read".
+void format_meta(const char *raw_date, const char *body, char *out, int cap)
+{
+    int words = 0;
+    bool in_word = false;
+    for (const char *p = body; *p; ++p) {
+        if (isspace((unsigned char)*p)) in_word = false;
+        else if (!in_word) { in_word = true; words++; }
+    }
+    int mins = words / 180;
+    if (mins < 1) mins = 1;
+
+    time_t t = parse_feed_date(raw_date);
+    if (!t) {
+        snprintf(out, cap, "%d min read", mins);
+        return;
+    }
+
+    time_t now = time(0);
+    struct tm lt_art, lt_now;
+    localtime_r(&t, &lt_art);
+    localtime_r(&now, &lt_now);
+
+    struct tm a = lt_art, b = lt_now;
+    a.tm_hour = b.tm_hour = 12;
+    a.tm_min = b.tm_min = 0;
+    a.tm_sec = b.tm_sec = 0;
+    int days = (int)((mktime(&b) - mktime(&a)) / 86400);
+
+    static const char *mon[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    char when[32];
+    if (days <= 0)
+        snprintf(when, sizeof(when), "Today %02d:%02d",
+                 lt_art.tm_hour, lt_art.tm_min);
+    else if (days == 1)
+        snprintf(when, sizeof(when), "Yesterday");
+    else
+        snprintf(when, sizeof(when), "%s %d",
+                 mon[lt_art.tm_mon], lt_art.tm_mday);
+
+    snprintf(out, cap, "%s \xC2\xB7 %d min read", when, mins);
+}
+
 void commit_feed_item(FeedArticleStore &store, int *count,
                       char *title, char *link, char *date, char *desc)
 {
     if (*count >= MAX_FEED_ARTICLES) return;
     int idx = (*count)++;
     copy_trimmed(store.titles[idx], TITLE_BUF, *title ? title : "Untitled article");
-    copy_trimmed(store.metas[idx], META_BUF, *date ? date : "Fetched just now");
     strip_markup(store.bodies[idx], BODY_BUF, *desc ? desc : link);
+    format_meta(date, store.bodies[idx], store.metas[idx], META_BUF);
+    if (idx == 0) {
+        char line[240];
+        snprintf(line, sizeof(line), "META raw=\"%.60s\" -> \"%s\"",
+                 date, store.metas[idx]);
+        write_sync_log(line);
+    }
     if (!store.bodies[idx][0])
         copy_trimmed(store.bodies[idx], BODY_BUF, "No summary was provided by this feed.");
     if (*link && (int)strlen(store.bodies[idx]) < BODY_BUF - 16) {
@@ -1557,7 +2012,8 @@ void commit_feed_item(FeedArticleStore &store, int *count,
         append_limited(store.bodies[idx], BODY_BUF, link);
     }
     store.articles[idx] = (Article){store.titles[idx], store.metas[idx], true,
-                                    store.bodies[idx]};
+                                    store.bodies[idx],
+                                    parse_feed_date(date)};
 }
 
 int parse_feed_xml(int feed_idx, const char *xml, int len)
@@ -1704,19 +2160,29 @@ sqlite3 *open_state_db(bool readonly)
     return NULL;
 }
 
-void save_state()
+void ensure_schema(sqlite3 *db)
 {
-    sqlite3 *db = open_state_db(false);
-    if (!db) return;
-
-    bool ok = exec_sql(db,
-        "BEGIN;"
+    exec_sql(db,
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
         "CREATE TABLE IF NOT EXISTS feeds(idx INTEGER PRIMARY KEY,"
         " name TEXT NOT NULL, url TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS articles(feed_idx INTEGER, art_idx INTEGER,"
         " title TEXT, meta TEXT, body TEXT, unread INTEGER, saved INTEGER,"
-        " PRIMARY KEY(feed_idx, art_idx));"
+        " ts INTEGER DEFAULT 0,"
+        " PRIMARY KEY(feed_idx, art_idx));");
+    // Migrate pre-ts databases; harmless "duplicate column" error otherwise.
+    sqlite3_exec(db, "ALTER TABLE articles ADD COLUMN ts INTEGER DEFAULT 0",
+                 NULL, NULL, NULL);
+}
+
+void save_state()
+{
+    sqlite3 *db = open_state_db(false);
+    if (!db) return;
+
+    ensure_schema(db);
+    bool ok = exec_sql(db,
+        "BEGIN;"
         "DELETE FROM feeds;"
         "DELETE FROM articles;");
 
@@ -1724,6 +2190,20 @@ void save_state()
     if (ok && sqlite3_prepare_v2(db,
             "INSERT OR REPLACE INTO meta VALUES('sync',?1)", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, sync_str, -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+
+    if (ok && sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO meta VALUES('scroll',?1)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, scroll_mode ? "1" : "0", -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+
+    if (ok && sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO meta VALUES('listscroll',?1)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, list_scroll_mode ? "1" : "0", -1, SQLITE_STATIC);
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
@@ -1741,7 +2221,7 @@ void save_state()
     }
 
     if (ok && sqlite3_prepare_v2(db,
-            "INSERT INTO articles VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO articles VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             -1, &st, NULL) == SQLITE_OK) {
         for (int i = 0; ok && i < feed_count; ++i) {
             int count = feeds[i].count;
@@ -1756,6 +2236,7 @@ void save_state()
                 sqlite3_bind_text(st, 5, a.body, -1, SQLITE_STATIC);
                 sqlite3_bind_int(st, 6, a.unread ? 1 : 0);
                 sqlite3_bind_int(st, 7, saved[i][j] ? 1 : 0);
+                sqlite3_bind_int64(st, 8, (sqlite3_int64)a.when);
                 ok = sqlite3_step(st) == SQLITE_DONE;
             }
         }
@@ -1769,8 +2250,9 @@ void save_state()
 
 bool load_state()
 {
-    sqlite3 *db = open_state_db(true);
+    sqlite3 *db = open_state_db(false);
     if (!db) return false;
+    ensure_schema(db);
 
     char loaded_sync[16] = "";
     sqlite3_stmt *st = NULL;
@@ -1779,6 +2261,24 @@ bool load_state()
         if (sqlite3_step(st) == SQLITE_ROW) {
             const unsigned char *v = sqlite3_column_text(st, 0);
             if (v) snprintf(loaded_sync, sizeof(loaded_sync), "%s", (const char *)v);
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='scroll'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(st, 0);
+            scroll_mode = v && v[0] == '1';
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='listscroll'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(st, 0);
+            list_scroll_mode = v && v[0] == '1';
         }
         sqlite3_finalize(st);
     }
@@ -1807,7 +2307,7 @@ bool load_state()
     int counts[MAX_FEEDS];
     memset(counts, 0, sizeof(counts));
     if (sqlite3_prepare_v2(db,
-            "SELECT feed_idx,art_idx,title,meta,body,unread,saved"
+            "SELECT feed_idx,art_idx,title,meta,body,unread,saved,ts"
             " FROM articles ORDER BY feed_idx,art_idx", -1, &st, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return false;
@@ -1829,7 +2329,8 @@ bool load_state()
                  body ? (const char *)body : "");
         store.articles[j] = (Article){store.titles[j], store.metas[j],
                                       sqlite3_column_int(st, 5) != 0,
-                                      store.bodies[j]};
+                                      store.bodies[j],
+                                      (time_t)sqlite3_column_int64(st, 7)};
         saved[i][j] = sqlite3_column_int(st, 6) != 0;
         counts[i]++;
     }
@@ -2122,6 +2623,20 @@ void go_back();
 void page_delta(int d)
 {
     if (view == VIEW_FEEDS) {
+        if (list_scroll_mode) {
+            int step = ScreenHeight() - 228 - FEED_ROW_H;
+            if (d > 0 && feed_scroll < feed_max_scroll) {
+                feed_scroll += step;
+                draw_screen();
+            } else if (d < 0 && feed_scroll > 0) {
+                feed_scroll -= step;
+                if (feed_scroll < 0) feed_scroll = 0;
+                draw_screen();
+            } else if (d < 0) {
+                CloseApp();
+            }
+            return;
+        }
         int next = feed_page + d;
         if (next >= 0 && next < feed_pages()) {
             feed_page = next;
@@ -2130,6 +2645,21 @@ void page_delta(int d)
             CloseApp();
         }
     } else if (view == VIEW_ARTICLES) {
+        if (list_scroll_mode) {
+            int step = ScreenHeight() - 216 - ART_ROW_H;
+            if (d > 0 && art_scroll < art_max_scroll) {
+                art_scroll += step;
+                draw_screen();
+            } else if (d < 0 && art_scroll > 0) {
+                art_scroll -= step;
+                if (art_scroll < 0) art_scroll = 0;
+                draw_screen();
+            } else if (d < 0) {
+                view = VIEW_FEEDS;
+                draw_screen();
+            }
+            return;
+        }
         int next = art_page + d;
         if (next >= 0 && next < article_pages()) {
             art_page = next;
@@ -2150,6 +2680,23 @@ void page_delta(int d)
         }
     } else if (view == VIEW_FEED_EDITOR || view == VIEW_DIAGNOSTICS) {
         if (d < 0) go_back();
+    } else if (scroll_mode) {
+        if (d > 0) {
+            if (read_scroll < read_max_scroll) {
+                read_scroll += read_scroll_step;
+                draw_screen();
+            } else {
+                next_article();
+            }
+        } else {
+            if (read_scroll > 0) {
+                read_scroll -= read_scroll_step;
+                if (read_scroll < 0) read_scroll = 0;
+                draw_screen();
+            } else {
+                previous_article_or_list();
+            }
+        }
     } else {
         int next = read_page + d;
         if (next >= 0 && next < read_pages) {
@@ -2168,6 +2715,7 @@ void go_back()
     if (view == VIEW_READING) {
         view = VIEW_ARTICLES;
         art_page = sel_article / LIST_ROWS;
+        art_scroll = sel_article * ART_ROW_H;
         draw_screen();
     } else if (view == VIEW_ARTICLES || view == VIEW_SETTINGS) {
         view = VIEW_FEEDS;
@@ -2200,16 +2748,21 @@ void handle_tap(int x, int y)
             draw_screen();
             return;
         }
-        if (y >= h - LIST_FOOTER_H - 2) {
+        if (!list_scroll_mode && y >= h - LIST_FOOTER_H - 2) {
             if (x < w / 3) page_delta(-1);
             else if (x > w * 2 / 3) page_delta(1);
             return;
         }
-        if (y >= 228 && y < 228 + LIST_ROWS * FEED_ROW_H) {
-            int idx = feed_page * LIST_ROWS + (y - 228) / FEED_ROW_H;
-            if (idx < feed_count) {
-                sel_feed = idx;
+        if (y >= 228) {
+            int idx = list_scroll_mode
+                          ? (y - 228 + feed_scroll) / FEED_ROW_H
+                          : feed_page * LIST_ROWS + (y - 228) / FEED_ROW_H;
+            if (!list_scroll_mode && (y - 228) / FEED_ROW_H >= LIST_ROWS)
+                return;
+            if (idx >= 0 && idx < feed_count) {
+                sel_feed = feed_order[idx];
                 art_page = 0;
+                art_scroll = 0;
                 view = VIEW_ARTICLES;
                 draw_screen();
             }
@@ -2219,14 +2772,18 @@ void handle_tap(int x, int y)
 
     if (view == VIEW_ARTICLES) {
         if (hit(z_back, x, y)) { go_back(); return; }
-        if (y >= h - LIST_FOOTER_H - 2) {
+        if (!list_scroll_mode && y >= h - LIST_FOOTER_H - 2) {
             if (x < w / 3) page_delta(-1);
             else if (x > w * 2 / 3) page_delta(1);
             return;
         }
-        if (y >= 216 && y < 216 + LIST_ROWS * ART_ROW_H) {
-            int idx = art_page * LIST_ROWS + (y - 216) / ART_ROW_H;
-            if (idx < feeds[sel_feed].count) {
+        if (y >= 216) {
+            int idx = list_scroll_mode
+                          ? (y - 216 + art_scroll) / ART_ROW_H
+                          : art_page * LIST_ROWS + (y - 216) / ART_ROW_H;
+            if (!list_scroll_mode && (y - 216) / ART_ROW_H >= LIST_ROWS)
+                return;
+            if (idx >= 0 && idx < feeds[sel_feed].count) {
                 open_article(sel_feed, idx);
                 draw_screen();
             }
@@ -2239,6 +2796,17 @@ void handle_tap(int x, int y)
         if (hit(z_settings_feeds, x, y)) {
             view = VIEW_FEED_SETTINGS;
             feed_settings_page = 0;
+            draw_screen();
+        } else if (hit(z_settings_scrollmode, x, y)) {
+            scroll_mode = !scroll_mode;
+            read_scroll = 0;
+            save_state();
+            draw_screen();
+        } else if (hit(z_settings_listscroll, x, y)) {
+            list_scroll_mode = !list_scroll_mode;
+            feed_scroll = art_scroll = 0;
+            feed_page = art_page = 0;
+            save_state();
             draw_screen();
         } else if (hit(z_settings_diagnostics, x, y)) {
             view = VIEW_DIAGNOSTICS;
@@ -2375,14 +2943,96 @@ void handle_key(int key)
     write_key_log(debug_key_line, key, changed ? 1 : 0);
 }
 
+long long now_ms()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+bool scroll_reading_active()
+{
+    return view == VIEW_READING && scroll_mode;
+}
+
+// Which scroll offset a touch drag moves in the current view, if any.
+int *drag_scroll_target(int *max_scroll)
+{
+    if (view == VIEW_READING && scroll_mode) {
+        *max_scroll = read_max_scroll;
+        return &read_scroll;
+    }
+    if (view == VIEW_FEEDS && list_scroll_mode) {
+        *max_scroll = feed_max_scroll;
+        return &feed_scroll;
+    }
+    if (view == VIEW_ARTICLES && list_scroll_mode) {
+        *max_scroll = art_max_scroll;
+        return &art_scroll;
+    }
+    return NULL;
+}
+
 void handle_key_press(int key)
 {
+    if (scroll_reading_active() && is_prev_key(key)) {
+        // Act on release so a 2s hold can mean "back to feeds" instead.
+        prev_key_down_ms = now_ms();
+        prev_key_hold_done = false;
+        release_already_handled = 0;
+        return;
+    }
+    if (scroll_reading_active() && is_next_key(key)) {
+        release_already_handled = key;
+        next_article();
+        return;
+    }
     release_already_handled = is_handled_key(key) ? key : 0;
+    handle_key(key);
+}
+
+void handle_key_repeat(int key)
+{
+    if (scroll_reading_active() && is_prev_key(key)) {
+        if (!prev_key_hold_done && now_ms() - prev_key_down_ms >= 2000) {
+            prev_key_hold_done = true;
+            swallow_prev_release = true;
+            go_home();
+        }
+        return;
+    }
+    if (scroll_reading_active() && is_next_key(key)) return;
     handle_key(key);
 }
 
 void handle_key_release(int key)
 {
+    if (swallow_prev_release && is_prev_key(key)) {
+        swallow_prev_release = false;
+        return;
+    }
+
+    if (scroll_reading_active() && is_prev_key(key)) {
+        if (prev_key_hold_done) {
+            prev_key_hold_done = false;
+            return;
+        }
+        if (now_ms() - prev_key_down_ms >= 2000) {
+            go_home();
+            return;
+        }
+        if (sel_article > 0) {
+            open_article(sel_feed, sel_article - 1);
+            draw_screen();
+        } else {
+            view = VIEW_ARTICLES;
+            art_page = sel_article / LIST_ROWS;
+        art_scroll = sel_article * ART_ROW_H;
+            draw_screen();
+        }
+        return;
+    }
+
     if (has_same_key_action(key, release_already_handled)) {
         release_already_handled = 0;
         return;
@@ -2407,8 +3057,42 @@ int main_handler(int event_type, int param_one, int param_two)
         draw_screen();
     } else if (event_type == EVT_SHOW) {
         draw_screen();
+    } else if (event_type == EVT_POINTERDOWN) {
+        int max_scroll;
+        int *target = drag_scroll_target(&max_scroll);
+        if (target) {
+            drag_start_y = param_two;
+            drag_start_scroll = *target;
+            drag_last_drawn = *target;
+            drag_active = false;
+        }
+    } else if (event_type == EVT_POINTERDRAG) {
+        int max_scroll;
+        int *target = drag_scroll_target(&max_scroll);
+        if (target) {
+            drag_active = true;
+            int pos = drag_start_scroll + (drag_start_y - param_two);
+            if (pos < 0) pos = 0;
+            if (pos > max_scroll) pos = max_scroll;
+            *target = pos;
+            if (abs(*target - drag_last_drawn) >= 120) {
+                fast_update_hint = true;
+                draw_screen();
+                fast_update_hint = false;
+                drag_last_drawn = *target;
+            }
+        }
     } else if (event_type == EVT_POINTERUP || event_type == EVT_TOUCHUP) {
-        handle_tap(param_one, param_two);
+        if (drag_active) {
+            drag_active = false;
+            // Settle at the released position without a full-screen flash.
+            fast_update_hint = true;
+            draw_screen();
+            fast_update_hint = false;
+        } else {
+            drag_active = false;
+            handle_tap(param_one, param_two);
+        }
     } else if (event_type == EVT_KEYPRESS) {
         record_key_debug("KEYPRESS", param_one, param_two);
         handle_key_press(param_one);
@@ -2419,8 +3103,7 @@ int main_handler(int event_type, int param_one, int param_two)
         draw_debug_overlay();
     } else if (event_type == EVT_KEYREPEAT) {
         record_key_debug("KEYREPEAT", param_one, param_two);
-        handle_key(param_one);
-        draw_debug_overlay();
+        handle_key_repeat(param_one);
     } else if (event_type == EVT_EXIT) {
         save_state();
         close_fonts();
