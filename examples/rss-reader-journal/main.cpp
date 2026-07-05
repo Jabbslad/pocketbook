@@ -7,13 +7,17 @@
 
 #include "inkview.h"
 
+#include "litehtml_container.h"
+
 #include <curl/curl.h>
 #include <libxml/HTMLparser.h>
 #include <libxml/xmlreader.h>
 #include <sqlite3.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <math.h>
 #include <stdio.h>
@@ -114,6 +118,7 @@ struct Article {
     bool unread;
     const char *body;  // paragraphs separated by '\n'
     time_t when;       // publication time (UTC), 0 if unknown
+    const char *raw;   // original feed HTML (litehtml rendering), may be NULL
 };
 
 const char *BODY_FEATURED =
@@ -270,12 +275,14 @@ const int MAX_FEED_BYTES = 512 * 1024;
 const int TITLE_BUF = 160;
 const int META_BUF = 96;
 const int BODY_BUF = 4096;
+const int RAW_BUF = 8192;
 
 struct FeedArticleStore {
     Article articles[MAX_FEED_ARTICLES];
     char titles[MAX_FEED_ARTICLES][TITLE_BUF];
     char metas[MAX_FEED_ARTICLES][META_BUF];
     char bodies[MAX_FEED_ARTICLES][BODY_BUF];
+    char raws[MAX_FEED_ARTICLES][RAW_BUF];
 };
 
 FeedArticleStore fetched_feed_store[MAX_FEEDS];
@@ -1376,6 +1383,122 @@ void draw_reading_footer(const char *center)
          ALIGN_CENTER | VALIGN_MIDDLE);
 }
 
+// ------------------------------------------------ litehtml reading path ---
+// When an article carries its original feed HTML, scroll mode renders it
+// through litehtml (issue #3) for real bold/italic/heading/blockquote
+// formatting. Fallback below handles plain-text articles.
+
+PbHtmlContainer *lit_container = NULL;
+std::shared_ptr<litehtml::document> lit_doc;
+int lit_doc_height = 0;
+
+const char *LIT_USER_CSS =
+    "body{margin:0;padding:0;color:#000}"
+    "a{color:#000;text-decoration:underline}"
+    "blockquote{margin:16px 0 16px 24px;padding-left:24px;"
+    "border-left:6px solid #888}"
+    "iframe,video,svg,script,style{display:none}"
+    // Feeds ship explicit width/height attributes (often full resolution);
+    // force them back to auto so litehtml's max-width path scales images
+    // to the column while preserving the aspect ratio.
+    "img{margin:12px 0;width:auto!important;height:auto!important;"
+    "max-width:100%!important}"
+    "hr{border:none;border-top:2px solid #000;margin:24px 0}";
+
+bool resolve_article_image(const char *src, char *path_out, int path_cap);
+
+void build_lit_doc()
+{
+    lit_doc = nullptr;
+    lit_doc_height = 0;
+    if (!scroll_mode) return;
+    const Feed &f = feeds[sel_feed];
+    const Article &a = f.articles[sel_article];
+    if (!a.raw || !a.raw[0]) return;
+
+    int cw = ScreenWidth() - READ_PAD * 2;
+    if (!lit_container) {
+        lit_container = new PbHtmlContainer(cw, body_sizes[body_size_idx]);
+        lit_container->set_image_resolver(resolve_article_image);
+    }
+    lit_container->set_default_font_px(body_sizes[body_size_idx]);
+    lit_container->set_view_height(ScreenHeight());
+    lit_container->clear_images();  // keep decoded images bounded per article
+
+    static char html[RAW_BUF + 1024];
+    snprintf(html, sizeof(html),
+             "<html><body>"
+             "<div style=\"font-style:italic;font-size:0.7em\">%s &#183; %s</div>"
+             "<h1 style=\"margin:12px 0 20px 0\">%s</h1>"
+             "<hr>%s</body></html>",
+             f.name, a.meta, a.title, a.raw);
+
+    lit_doc = litehtml::document::createFromString(html, lit_container,
+                                                   litehtml::master_css,
+                                                   LIT_USER_CSS);
+    if (lit_doc) {
+        lit_doc->render(cw);
+        lit_doc_height = lit_doc->height();
+    }
+}
+
+void draw_reading_progress_bar(long total, int avail)
+{
+    int w = ScreenWidth();
+    FillArea(0, 0, w, READ_BAR_H, C_RULE);
+    long done = total <= avail ? total : (long)read_scroll + avail;
+    int fill_w = (int)((long long)w * done / (total > 0 ? total : 1));
+    if (fill_w > w) fill_w = w;
+    if (fill_w > 0) FillArea(0, 0, fill_w, READ_BAR_H, C_BLACK);
+}
+
+void draw_reading_lit()
+{
+    int w = ScreenWidth();
+    int h = ScreenHeight();
+    int top = PAD;
+    int footer_top = h - 24;
+    int avail = footer_top - top;
+    char buf[32];
+
+    z_save = z_aa = z_next_article = (Zone){0, 0, 0, 0};
+    body_link_zone_count = 0;
+
+    bool content_only = drag_frame_hint;
+    if (content_only) FillArea(0, 0, w, h, C_WHITE);
+    else ClearScreen();
+
+    read_max_scroll = lit_doc_height - avail;
+    if (read_max_scroll < 0) read_max_scroll = 0;
+    if (read_scroll > read_max_scroll) read_scroll = read_max_scroll;
+    if (read_scroll < 0) read_scroll = 0;
+
+    SetClip(0, top, w, avail);
+    // Clip is in screen coordinates (litehtml compares element positions
+    // after applying the draw offset).
+    litehtml::position clip(0, top, w, avail);
+    lit_doc->draw(0, READ_PAD, top - read_scroll, &clip);
+    SetClip(0, 0, w, h);
+
+    if (reading_bar_visible) draw_reading_progress_bar(lit_doc_height, avail);
+
+    if (content_only) {
+        DynamicUpdateBW(0, 0, w, h);
+        return;
+    }
+
+    if (reading_footer_visible) {
+        int pct = lit_doc_height <= avail
+                      ? 100
+                      : (int)(((long)(read_scroll + avail)) * 100 / lit_doc_height);
+        if (pct > 100) pct = 100;
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+        draw_reading_footer(buf);
+    }
+    if (fast_update_hint) SoftUpdate();
+    else FullUpdate();
+}
+
 // Scrollable reading mode: the whole article (title + body) is one column
 // moved by a pixel offset; page buttons scroll by nearly a screenful.
 void draw_reading_scrolled()
@@ -1539,7 +1662,8 @@ void draw_reading_paginated()
 
 void draw_reading()
 {
-    if (scroll_mode) draw_reading_scrolled();
+    if (scroll_mode && lit_doc) draw_reading_lit();
+    else if (scroll_mode) draw_reading_scrolled();
     else draw_reading_paginated();
 }
 
@@ -1567,6 +1691,7 @@ void open_article(int fi, int ai)
     reading_bar_visible = false;
     view = VIEW_READING;
     paginate_article();
+    build_lit_doc();
 }
 
 void next_article()
@@ -2035,6 +2160,131 @@ bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_ca
     return false;
 }
 
+// --------------------------------------------------------- image cache ---
+// Article images are fetched once via runtime curl into a flash cache and
+// decoded scaled to the content column (issue #3, phase 2).
+
+const char *IMAGE_CACHE_DIR =
+    "/mnt/ext1/system/config/rss-reader-journal-images";
+const long IMAGE_CACHE_LIMIT = 20L * 1024 * 1024;
+
+unsigned long fnv1a(const char *s)
+{
+    unsigned long h = 2166136261UL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 16777619UL;
+    }
+    return h;
+}
+
+bool fetch_url_to_file(const char *url, const char *path)
+{
+    char err[96];
+    CurlRuntime curl;
+    if (!load_curl(&curl, err, sizeof(err))) return false;
+
+    CURL *easy = curl.easy_init();
+    if (!easy) {
+        unload_curl(&curl);
+        return false;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        curl.easy_cleanup(easy);
+        unload_curl(&curl);
+        return false;
+    }
+
+    char dns_servers[128];
+    bool has_dns = get_device_dns_servers(dns_servers, sizeof(dns_servers));
+    curl.easy_setopt(easy, CURLOPT_URL, url);
+    curl.easy_setopt(easy, CURLOPT_WRITEDATA, fp);
+    curl.easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl.easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl.easy_setopt(easy, CURLOPT_TIMEOUT, 15L);
+    curl.easy_setopt(easy, CURLOPT_USERAGENT, "PocketBook RSS Reader/0.1");
+    curl.easy_setopt(easy, CURLOPT_MAXFILESIZE, 4L * 1024 * 1024);
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (has_dns) curl.easy_setopt(easy, CURLOPT_DNS_SERVERS, dns_servers);
+
+    CURLcode rc = curl.easy_perform(easy);
+    long status = 0;
+    curl.easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+    curl.easy_cleanup(easy);
+    unload_curl(&curl);
+    fclose(fp);
+
+    bool ok = rc == CURLE_OK && status < 400;
+    if (!ok) remove(path);
+    return ok;
+}
+
+bool resolve_article_image(const char *src, char *path_out, int path_cap)
+{
+    char url[512];
+    if (!strncmp(src, "//", 2)) snprintf(url, sizeof(url), "https:%s", src);
+    else snprintf(url, sizeof(url), "%s", src);
+    if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) return false;
+
+    mkdir(IMAGE_CACHE_DIR, 0755);
+    snprintf(path_out, path_cap, "%s/%08lx.img", IMAGE_CACHE_DIR, fnv1a(url));
+
+    struct stat sb;
+    if (stat(path_out, &sb) == 0 && sb.st_size > 0) return true;
+    if (!(QueryNetwork() & NET_CONNECTED)) return false;  // cache-only offline
+
+    bool ok = fetch_url_to_file(url, path_out);
+    char line[600];
+    snprintf(line, sizeof(line), "IMG %s %s", ok ? "OK" : "FAIL", url);
+    write_diag_log(line);
+    return ok;
+}
+
+void prune_image_cache()
+{
+    DIR *d = opendir(IMAGE_CACHE_DIR);
+    if (!d) return;
+
+    struct CacheEnt {
+        char name[64];
+        long size;
+        time_t mtime;
+    };
+    static CacheEnt ents[256];
+    int n = 0;
+    long total = 0;
+    struct dirent *e;
+    char path[512];
+    struct stat sb;
+
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "%s/%s", IMAGE_CACHE_DIR, e->d_name);
+        if (stat(path, &sb) != 0) continue;
+        total += sb.st_size;
+        if (n < 256) {
+            snprintf(ents[n].name, sizeof(ents[n].name), "%s", e->d_name);
+            ents[n].size = sb.st_size;
+            ents[n].mtime = sb.st_mtime;
+            n++;
+        }
+    }
+    closedir(d);
+
+    while (total > IMAGE_CACHE_LIMIT && n > 0) {
+        int oldest = 0;
+        for (int i = 1; i < n; ++i)
+            if (ents[i].mtime < ents[oldest].mtime) oldest = i;
+        snprintf(path, sizeof(path), "%s/%s", IMAGE_CACHE_DIR,
+                 ents[oldest].name);
+        remove(path);
+        total -= ents[oldest].size;
+        ents[oldest] = ents[--n];
+    }
+}
+
 int field_for_name(const char *name)
 {
     if (!strcmp(name, "title")) return 1;
@@ -2178,6 +2428,7 @@ void commit_feed_item(FeedArticleStore &store, int *count,
     copy_trimmed(store.titles[idx], TITLE_BUF, *title ? title : "Untitled article");
     strip_markup(store.bodies[idx], BODY_BUF, *desc ? desc : link);
     format_meta(date, store.bodies[idx], store.metas[idx], META_BUF);
+    snprintf(store.raws[idx], RAW_BUF, "%s", desc);
     if (idx == 0) {
         char line[240];
         snprintf(line, sizeof(line), "META raw=\"%.60s\" -> \"%s\"",
@@ -2192,7 +2443,7 @@ void commit_feed_item(FeedArticleStore &store, int *count,
     }
     store.articles[idx] = (Article){store.titles[idx], store.metas[idx], true,
                                     store.bodies[idx],
-                                    parse_feed_date(date)};
+                                    parse_feed_date(date), store.raws[idx]};
 }
 
 int parse_feed_xml(int feed_idx, const char *xml, int len)
@@ -2209,7 +2460,8 @@ int parse_feed_xml(int feed_idx, const char *xml, int len)
     char title[TITLE_BUF] = "";
     char link[256] = "";
     char date[META_BUF] = "";
-    char desc[BODY_BUF] = "";
+    static char desc[RAW_BUF];
+    desc[0] = 0;
 
     while (count < MAX_FEED_ARTICLES && xmlTextReaderRead(reader) == 1) {
         int type = xmlTextReaderNodeType(reader);
@@ -2349,8 +2601,10 @@ void ensure_schema(sqlite3 *db)
         " title TEXT, meta TEXT, body TEXT, unread INTEGER, saved INTEGER,"
         " ts INTEGER DEFAULT 0,"
         " PRIMARY KEY(feed_idx, art_idx));");
-    // Migrate pre-ts databases; harmless "duplicate column" error otherwise.
+    // Migrate older databases; harmless "duplicate column" errors otherwise.
     sqlite3_exec(db, "ALTER TABLE articles ADD COLUMN ts INTEGER DEFAULT 0",
+                 NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE articles ADD COLUMN raw TEXT DEFAULT ''",
                  NULL, NULL, NULL);
 }
 
@@ -2407,7 +2661,7 @@ void save_state()
     }
 
     if (ok && sqlite3_prepare_v2(db,
-            "INSERT INTO articles VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO articles VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             -1, &st, NULL) == SQLITE_OK) {
         for (int i = 0; ok && i < feed_count; ++i) {
             int count = feeds[i].count;
@@ -2423,6 +2677,7 @@ void save_state()
                 sqlite3_bind_int(st, 6, a.unread ? 1 : 0);
                 sqlite3_bind_int(st, 7, saved[i][j] ? 1 : 0);
                 sqlite3_bind_int64(st, 8, (sqlite3_int64)a.when);
+                sqlite3_bind_text(st, 9, a.raw ? a.raw : "", -1, SQLITE_STATIC);
                 ok = sqlite3_step(st) == SQLITE_DONE;
             }
         }
@@ -2502,7 +2757,7 @@ bool load_state()
     int counts[MAX_FEEDS];
     memset(counts, 0, sizeof(counts));
     if (sqlite3_prepare_v2(db,
-            "SELECT feed_idx,art_idx,title,meta,body,unread,saved,ts"
+            "SELECT feed_idx,art_idx,title,meta,body,unread,saved,ts,raw"
             " FROM articles ORDER BY feed_idx,art_idx", -1, &st, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return false;
@@ -2522,10 +2777,13 @@ bool load_state()
                  meta ? (const char *)meta : "");
         snprintf(store.bodies[j], BODY_BUF, "%s",
                  body ? (const char *)body : "");
+        const unsigned char *raw = sqlite3_column_text(st, 8);
+        snprintf(store.raws[j], RAW_BUF, "%s", raw ? (const char *)raw : "");
         store.articles[j] = (Article){store.titles[j], store.metas[j],
                                       sqlite3_column_int(st, 5) != 0,
                                       store.bodies[j],
-                                      (time_t)sqlite3_column_int64(st, 7)};
+                                      (time_t)sqlite3_column_int64(st, 7),
+                                      store.raws[j]};
         saved[i][j] = sqlite3_column_int(st, 6) != 0;
         counts[i]++;
     }
@@ -2810,6 +3068,14 @@ void cycle_body_size()
     read_page = 0;
     for (int p = 0; p < read_pages; ++p)
         if (page_start[p] <= first && first < page_start[p + 1]) read_page = p;
+
+    if (lit_doc) {
+        // Rebuild at the new font size, keeping the position proportional.
+        int old_h = lit_doc_height;
+        build_lit_doc();
+        if (old_h > 0 && lit_doc_height > 0)
+            read_scroll = (int)((long long)read_scroll * lit_doc_height / old_h);
+    }
     draw_screen();
 }
 
@@ -2994,6 +3260,7 @@ void handle_tap(int x, int y)
         } else if (hit(z_settings_scrollmode, x, y)) {
             scroll_mode = !scroll_mode;
             read_scroll = 0;
+            lit_doc = nullptr;  // rebuilt on next article open
             save_state();
             draw_screen();
         } else if (hit(z_settings_listscroll, x, y)) {
@@ -3060,6 +3327,28 @@ void handle_tap(int x, int y)
     } else if (hit(z_next_article, x, y)) {
         next_article();
     } else {
+        if (lit_doc && lit_container) {
+            // Hit-test litehtml anchors at document coordinates.
+            int dx = x - READ_PAD;
+            int dy = y - PAD + read_scroll;
+            litehtml::position::vector redraw;
+            lit_doc->on_lbutton_down(dx, dy, dx, dy, redraw);
+            lit_doc->on_lbutton_up(dx, dy, dx, dy, redraw);
+            const char *url = lit_container->take_clicked_url();
+            if (url) {
+                char u[256];
+                snprintf(u, sizeof(u), "%s", url);
+                lit_container->clear_clicked_url();
+                char logline[360];
+                snprintf(logline, sizeof(logline),
+                         "link-tap lit x=%d y=%d url=%s", x, y, u);
+                write_diag_log(logline);
+                if (!strncmp(u, "http://", 7) || !strncmp(u, "https://", 8)) {
+                    open_url(u);
+                    return;
+                }
+            }
+        }
         for (int i = 0; i < body_link_zone_count; ++i) {
             if (hit(z_body_links[i], x, y)) {
                 char logline[360];
@@ -3264,6 +3553,7 @@ int main_handler(int event_type, int param_one, int param_two)
         xmlInitParser();
         memset(saved, 0, sizeof(saved));
         load_state();
+        prune_image_cache();
         open_fonts();
         refresh_date();
         draw_screen();
@@ -3322,6 +3612,7 @@ int main_handler(int event_type, int param_one, int param_two)
         handle_key_repeat(param_one);
     } else if (event_type == EVT_EXIT) {
         save_state();
+        lit_doc = nullptr;  // frees litehtml fonts via the container
         close_fonts();
         xmlCleanupParser();
     }
