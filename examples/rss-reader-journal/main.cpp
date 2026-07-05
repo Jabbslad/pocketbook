@@ -1462,7 +1462,9 @@ void draw_reading_lit()
     if (read_scroll < 0) read_scroll = 0;
 
     SetClip(0, top, w, avail);
-    litehtml::position clip(0, read_scroll, w - READ_PAD * 2, avail);
+    // Clip is in screen coordinates (litehtml compares element positions
+    // after applying the draw offset).
+    litehtml::position clip(0, top, w, avail);
     lit_doc->draw(0, READ_PAD, top - read_scroll, &clip);
     SetClip(0, 0, w, h);
 

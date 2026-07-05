@@ -86,7 +86,12 @@ void PbHtmlContainer::draw_text(litehtml::uint_ptr /*hdc*/, const char *text,
     PbFont *f = (PbFont *)hFont;
     if (!f || !f->font) return;
     SetFont(f->font, gray_of(color));
-    DrawTextRect(pos.x, pos.y + m_offset_y, pos.width > 0 ? pos.width : m_width,
+    // Overdraw width: DrawTextRect clips glyphs that do not fit the box,
+    // and its internal measurement can be slightly wider than StringWidth,
+    // which silently drops the last letter of words. litehtml positions
+    // each run itself, so a generous box is safe.
+    DrawTextRect(pos.x, pos.y + m_offset_y,
+                 (pos.width > 0 ? pos.width : m_width) + 200,
                  pos.height > 0 ? pos.height : f->height, (char *)text,
                  ALIGN_LEFT | VALIGN_TOP);
 }
