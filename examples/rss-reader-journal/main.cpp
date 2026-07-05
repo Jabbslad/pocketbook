@@ -1436,19 +1436,52 @@ void next_article()
     }
 }
 
-void previous_article_or_list()
+void back_to_article_list()
 {
-    if (sel_article > 0) {
-        open_article(sel_feed, sel_article - 1);
-        read_page = read_pages - 1;
-        read_scroll = 1 << 28;  // clamped to the end at draw time
-        draw_screen();
-    } else {
-        view = VIEW_ARTICLES;
-        art_page = sel_article / LIST_ROWS;
-        art_scroll = sel_article * ART_ROW_H;
-        draw_screen();
+    view = VIEW_ARTICLES;
+    art_page = sel_article / LIST_ROWS;
+    art_scroll = sel_article * ART_ROW_H;
+    draw_screen();
+}
+
+// Next unread article in the current feed (forward only); if none remain,
+// return to the feed's article list.
+void open_next_unread_article()
+{
+    const Feed &f = feeds[sel_feed];
+    for (int j = sel_article + 1; j < f.count; ++j) {
+        if (f.articles[j].unread) {
+            open_article(sel_feed, j);
+            draw_screen();
+            return;
+        }
     }
+    back_to_article_list();
+}
+
+// Next feed (in display order) that still has unread articles; if none,
+// return to the feed list.
+void open_next_unread_feed()
+{
+    compute_feed_order();
+    int pos = 0;
+    for (int i = 0; i < feed_count; ++i)
+        if (feed_order[i] == sel_feed) { pos = i; break; }
+
+    for (int step = 1; step <= feed_count; ++step) {
+        int idx = feed_order[(pos + step) % feed_count];
+        if (idx == sel_feed) continue;
+        if (feed_unread(feeds[idx]) > 0) {
+            sel_feed = idx;
+            art_page = 0;
+            art_scroll = 0;
+            view = VIEW_ARTICLES;
+            draw_screen();
+            return;
+        }
+    }
+    view = VIEW_FEEDS;
+    draw_screen();
 }
 
 void copy_trimmed(char *dst, int cap, const char *src)
@@ -2681,31 +2714,17 @@ void page_delta(int d)
     } else if (view == VIEW_FEED_EDITOR || view == VIEW_DIAGNOSTICS) {
         if (d < 0) go_back();
     } else if (scroll_mode) {
-        if (d > 0) {
-            if (read_scroll < read_max_scroll) {
-                read_scroll += read_scroll_step;
-                draw_screen();
-            } else {
-                next_article();
-            }
-        } else {
-            if (read_scroll > 0) {
-                read_scroll -= read_scroll_step;
-                if (read_scroll < 0) read_scroll = 0;
-                draw_screen();
-            } else {
-                previous_article_or_list();
-            }
-        }
+        if (d > 0) open_next_unread_article();
+        else back_to_article_list();
     } else {
         int next = read_page + d;
         if (next >= 0 && next < read_pages) {
             read_page = next;
             draw_screen();
         } else if (d > 0) {
-            next_article();
+            open_next_unread_article();
         } else {
-            previous_article_or_list();
+            back_to_article_list();
         }
     }
 }
@@ -2925,11 +2944,22 @@ void handle_key(int key)
         action = "HOME";
         go_home();
     } else if (is_prev_key(key)) {
-        action = "PREV";
-        page_delta(-1);
+        if (view == VIEW_ARTICLES) {
+            action = "BACK-TO-FEEDS";
+            view = VIEW_FEEDS;
+            draw_screen();
+        } else {
+            action = "PREV";
+            page_delta(-1);
+        }
     } else if (is_next_key(key)) {
-        action = "NEXT";
-        page_delta(1);
+        if (view == VIEW_ARTICLES) {
+            action = "NEXT-UNREAD-FEED";
+            open_next_unread_feed();
+        } else {
+            action = "NEXT";
+            page_delta(1);
+        }
     }
 
     bool changed = before_view != view || before_feed_page != feed_page ||
@@ -2984,7 +3014,7 @@ void handle_key_press(int key)
     }
     if (scroll_reading_active() && is_next_key(key)) {
         release_already_handled = key;
-        next_article();
+        open_next_unread_article();
         return;
     }
     release_already_handled = is_handled_key(key) ? key : 0;
@@ -3002,6 +3032,8 @@ void handle_key_repeat(int key)
         return;
     }
     if (scroll_reading_active() && is_next_key(key)) return;
+    // Holding a button on the article list must not skip through feeds.
+    if (view == VIEW_ARTICLES && (is_prev_key(key) || is_next_key(key))) return;
     handle_key(key);
 }
 
@@ -3021,15 +3053,7 @@ void handle_key_release(int key)
             go_home();
             return;
         }
-        if (sel_article > 0) {
-            open_article(sel_feed, sel_article - 1);
-            draw_screen();
-        } else {
-            view = VIEW_ARTICLES;
-            art_page = sel_article / LIST_ROWS;
-        art_scroll = sel_article * ART_ROW_H;
-            draw_screen();
-        }
+        back_to_article_list();
         return;
     }
 
