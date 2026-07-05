@@ -274,6 +274,9 @@ int feed_settings_page = 0;
 int editing_feed_idx = -1;
 int pending_delete_feed_idx = -1;
 bool pending_delete_from_editor = false;
+int context_feed_idx = -1;
+bool feed_context_menu_open = false;
+bool suppress_next_pointer_up = false;
 
 const int MAX_FEED_SEARCH_RESULTS = LIST_ROWS;
 struct FeedSearchResult {
@@ -945,14 +948,9 @@ const int PINNED_ROWS = 2;  // 0 = Starred Articles, 1 = All Articles
 
 ibitmap *feed_icon_bitmap(int idx);
 
-// 88px icon tile with a black border; contents centered.
-void draw_icon_tile_frame(int x, int y)
+// 88px icon tile area; contents are centered without a border.
+void draw_icon_tile_frame(int, int)
 {
-    const int T = 88;
-    FillArea(x, y, T, 2, C_BLACK);
-    FillArea(x, y + T - 2, T, 2, C_BLACK);
-    FillArea(x, y, 2, T, C_BLACK);
-    FillArea(x + T - 2, y, 2, T, C_BLACK);
 }
 
 void draw_monogram_tile(int x, int y, const char *name)
@@ -4175,6 +4173,57 @@ void go_home()
     draw_screen();
 }
 
+int feed_at_feed_list_point(int y)
+{
+    if (view != VIEW_FEEDS || y < 228) return -1;
+    compute_feed_order();
+
+    int row;
+    if (list_scroll_mode) {
+        row = (y - 228 + feed_scroll) / FEED_ROW_H;
+    } else {
+        int visible_row = (y - 228) / FEED_ROW_H;
+        if (visible_row < 0 || visible_row >= LIST_ROWS) return -1;
+        row = feed_page * LIST_ROWS + visible_row;
+    }
+
+    if (row < PINNED_ROWS) return -1;
+    int pos = row - PINNED_ROWS;
+    if (pos < 0 || pos >= feed_count) return -1;
+    return feed_order[pos];
+}
+
+void mark_feed_as_read(int idx)
+{
+    if (idx < 0 || idx >= feed_count) return;
+    for (int i = 0; i < feeds[idx].count; ++i)
+        feeds[idx].articles[i].unread = false;
+    save_state();
+    draw_screen();
+}
+
+imenu feed_context_menu[] = {
+    {ITEM_ACTIVE, 1, (char *)"Mark as Read", NULL},
+    {0, 0, NULL, NULL},
+};
+
+void feed_context_menu_handler(int index)
+{
+    feed_context_menu_open = false;
+    if (index == 1) mark_feed_as_read(context_feed_idx);
+    context_feed_idx = -1;
+}
+
+void handle_feed_long_press(int x, int y)
+{
+    int idx = feed_at_feed_list_point(y);
+    if (idx < 0) return;
+    context_feed_idx = idx;
+    feed_context_menu_open = true;
+    suppress_next_pointer_up = true;
+    OpenMenu(feed_context_menu, 0, x, y, feed_context_menu_handler);
+}
+
 void handle_key(int key)
 {
     View before_view = view;
@@ -4339,6 +4388,9 @@ int main_handler(int event_type, int param_one, int param_two)
             drag_last_drawn = *target;
             drag_active = false;
         }
+    } else if (event_type == EVT_POINTERLONG) {
+        if (!feed_context_menu_open && !drag_active)
+            handle_feed_long_press(param_one, param_two);
     } else if (event_type == EVT_POINTERDRAG) {
         int max_scroll;
         int *target = drag_scroll_target(&max_scroll);
@@ -4360,7 +4412,10 @@ int main_handler(int event_type, int param_one, int param_two)
             }
         }
     } else if (event_type == EVT_POINTERUP || event_type == EVT_TOUCHUP) {
-        if (drag_active) {
+        if (suppress_next_pointer_up) {
+            suppress_next_pointer_up = false;
+            drag_active = false;
+        } else if (drag_active) {
             drag_active = false;
             // Settle at the released position without a full-screen flash.
             fast_update_hint = true;
