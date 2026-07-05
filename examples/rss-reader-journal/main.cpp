@@ -15,7 +15,9 @@
 #include <sqlite3.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <math.h>
 #include <stdio.h>
@@ -1395,8 +1397,11 @@ const char *LIT_USER_CSS =
     "a{color:#000;text-decoration:underline}"
     "blockquote{margin:16px 0 16px 24px;padding-left:24px;"
     "border-left:6px solid #888}"
-    "img,figure,iframe,video{display:none}"
+    "iframe,video,svg,script,style{display:none}"
+    "img{margin:12px 0}"
     "hr{border:none;border-top:2px solid #000;margin:24px 0}";
+
+bool resolve_article_image(const char *src, char *path_out, int path_cap);
 
 void build_lit_doc()
 {
@@ -1408,10 +1413,13 @@ void build_lit_doc()
     if (!a.raw || !a.raw[0]) return;
 
     int cw = ScreenWidth() - READ_PAD * 2;
-    if (!lit_container)
+    if (!lit_container) {
         lit_container = new PbHtmlContainer(cw, body_sizes[body_size_idx]);
+        lit_container->set_image_resolver(resolve_article_image);
+    }
     lit_container->set_default_font_px(body_sizes[body_size_idx]);
     lit_container->set_view_height(ScreenHeight());
+    lit_container->clear_images();  // keep decoded images bounded per article
 
     static char html[RAW_BUF + 1024];
     snprintf(html, sizeof(html),
@@ -2146,6 +2154,131 @@ bool fetch_url(const char *url, char *buffer, int cap, char *error, int error_ca
     snprintf(logline, sizeof(logline), "FETCH curl FAIL error=%s url=%s", error, url);
     write_sync_log(logline);
     return false;
+}
+
+// --------------------------------------------------------- image cache ---
+// Article images are fetched once via runtime curl into a flash cache and
+// decoded scaled to the content column (issue #3, phase 2).
+
+const char *IMAGE_CACHE_DIR =
+    "/mnt/ext1/system/config/rss-reader-journal-images";
+const long IMAGE_CACHE_LIMIT = 20L * 1024 * 1024;
+
+unsigned long fnv1a(const char *s)
+{
+    unsigned long h = 2166136261UL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 16777619UL;
+    }
+    return h;
+}
+
+bool fetch_url_to_file(const char *url, const char *path)
+{
+    char err[96];
+    CurlRuntime curl;
+    if (!load_curl(&curl, err, sizeof(err))) return false;
+
+    CURL *easy = curl.easy_init();
+    if (!easy) {
+        unload_curl(&curl);
+        return false;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        curl.easy_cleanup(easy);
+        unload_curl(&curl);
+        return false;
+    }
+
+    char dns_servers[128];
+    bool has_dns = get_device_dns_servers(dns_servers, sizeof(dns_servers));
+    curl.easy_setopt(easy, CURLOPT_URL, url);
+    curl.easy_setopt(easy, CURLOPT_WRITEDATA, fp);
+    curl.easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl.easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl.easy_setopt(easy, CURLOPT_TIMEOUT, 15L);
+    curl.easy_setopt(easy, CURLOPT_USERAGENT, "PocketBook RSS Reader/0.1");
+    curl.easy_setopt(easy, CURLOPT_MAXFILESIZE, 4L * 1024 * 1024);
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl.easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (has_dns) curl.easy_setopt(easy, CURLOPT_DNS_SERVERS, dns_servers);
+
+    CURLcode rc = curl.easy_perform(easy);
+    long status = 0;
+    curl.easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+    curl.easy_cleanup(easy);
+    unload_curl(&curl);
+    fclose(fp);
+
+    bool ok = rc == CURLE_OK && status < 400;
+    if (!ok) remove(path);
+    return ok;
+}
+
+bool resolve_article_image(const char *src, char *path_out, int path_cap)
+{
+    char url[512];
+    if (!strncmp(src, "//", 2)) snprintf(url, sizeof(url), "https:%s", src);
+    else snprintf(url, sizeof(url), "%s", src);
+    if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) return false;
+
+    mkdir(IMAGE_CACHE_DIR, 0755);
+    snprintf(path_out, path_cap, "%s/%08lx.img", IMAGE_CACHE_DIR, fnv1a(url));
+
+    struct stat sb;
+    if (stat(path_out, &sb) == 0 && sb.st_size > 0) return true;
+    if (!(QueryNetwork() & NET_CONNECTED)) return false;  // cache-only offline
+
+    bool ok = fetch_url_to_file(url, path_out);
+    char line[600];
+    snprintf(line, sizeof(line), "IMG %s %s", ok ? "OK" : "FAIL", url);
+    write_diag_log(line);
+    return ok;
+}
+
+void prune_image_cache()
+{
+    DIR *d = opendir(IMAGE_CACHE_DIR);
+    if (!d) return;
+
+    struct CacheEnt {
+        char name[64];
+        long size;
+        time_t mtime;
+    };
+    static CacheEnt ents[256];
+    int n = 0;
+    long total = 0;
+    struct dirent *e;
+    char path[512];
+    struct stat sb;
+
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "%s/%s", IMAGE_CACHE_DIR, e->d_name);
+        if (stat(path, &sb) != 0) continue;
+        total += sb.st_size;
+        if (n < 256) {
+            snprintf(ents[n].name, sizeof(ents[n].name), "%s", e->d_name);
+            ents[n].size = sb.st_size;
+            ents[n].mtime = sb.st_mtime;
+            n++;
+        }
+    }
+    closedir(d);
+
+    while (total > IMAGE_CACHE_LIMIT && n > 0) {
+        int oldest = 0;
+        for (int i = 1; i < n; ++i)
+            if (ents[i].mtime < ents[oldest].mtime) oldest = i;
+        snprintf(path, sizeof(path), "%s/%s", IMAGE_CACHE_DIR,
+                 ents[oldest].name);
+        remove(path);
+        total -= ents[oldest].size;
+        ents[oldest] = ents[--n];
+    }
 }
 
 int field_for_name(const char *name)
@@ -3416,6 +3549,7 @@ int main_handler(int event_type, int param_one, int param_two)
         xmlInitParser();
         memset(saved, 0, sizeof(saved));
         load_state();
+        prune_image_cache();
         open_fonts();
         refresh_date();
         draw_screen();

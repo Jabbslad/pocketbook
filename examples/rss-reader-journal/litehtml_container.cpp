@@ -133,18 +133,59 @@ void PbHtmlContainer::draw_list_marker(litehtml::uint_ptr /*hdc*/,
     }
 }
 
-void PbHtmlContainer::load_image(const char * /*src*/, const char * /*baseurl*/,
-                                 bool /*redraw_on_ready*/)
+void PbHtmlContainer::clear_images()
 {
-    // Phase 1: images are not loaded.
+    for (std::map<std::string, ibitmap *>::iterator it = m_images.begin();
+         it != m_images.end(); ++it)
+        if (it->second) free(it->second);
+    m_images.clear();
 }
 
-void PbHtmlContainer::get_image_size(const char * /*src*/,
+void PbHtmlContainer::load_image(const char *src, const char * /*baseurl*/,
+                                 bool /*redraw_on_ready*/)
+{
+    if (!src || !*src || !m_resolver) return;
+    std::string key(src);
+    if (m_images.count(key)) return;
+
+    ibitmap *bmp = NULL;
+    char path[512];
+    if (m_resolver(src, path, sizeof(path))) {
+        unsigned char magic[8];
+        memset(magic, 0, sizeof(magic));
+        FILE *fp = fopen(path, "rb");
+        if (fp) {
+            if (fread(magic, 1, sizeof(magic), fp) < 4) memset(magic, 0, 8);
+            fclose(fp);
+        }
+        // Decode scaled to the content box: e-ink has no use for larger.
+        int max_h = m_view_height;
+        if (magic[0] == 0xFF && magic[1] == 0xD8)
+            bmp = LoadJPEG(path, m_width, max_h, 0, 0, 1);
+        else if (magic[0] == 0x89 && magic[1] == 'P')
+            bmp = LoadPNGStretch(path, m_width, max_h, 1, 1);
+        else
+            bmp = LoadBitmap(path);
+    }
+    m_images[key] = bmp;  // NULL too: negative-cache failed loads
+}
+
+void PbHtmlContainer::get_image_size(const char *src,
                                      const char * /*baseurl*/,
                                      litehtml::size &sz)
 {
     sz.width = 0;
     sz.height = 0;
+    if (!src) return;
+    std::map<std::string, ibitmap *>::iterator it = m_images.find(src);
+    if (it == m_images.end() || !it->second) return;
+
+    sz.width = it->second->width;
+    sz.height = it->second->height;
+    if (sz.width > m_width) {  // clamp layout size to the column
+        sz.height = sz.height * m_width / sz.width;
+        sz.width = m_width;
+    }
 }
 
 void PbHtmlContainer::draw_background(litehtml::uint_ptr /*hdc*/,
@@ -152,6 +193,18 @@ void PbHtmlContainer::draw_background(litehtml::uint_ptr /*hdc*/,
 {
     for (size_t i = 0; i < bgs.size(); ++i) {
         const litehtml::background_paint &bg = bgs[i];
+
+        if (!bg.image.empty()) {
+            std::map<std::string, ibitmap *>::iterator it =
+                m_images.find(bg.image);
+            if (it != m_images.end() && it->second &&
+                bg.image_size.width > 0 && bg.image_size.height > 0)
+                StretchBitmap(bg.position_x, bg.position_y + m_offset_y,
+                              bg.image_size.width, bg.image_size.height,
+                              it->second, 0);
+            continue;
+        }
+
         if (bg.color.alpha == 0) continue;
         int g = gray_of(bg.color);
         if (g == 0xFFFFFF) continue;  // page is already white

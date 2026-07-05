@@ -1,11 +1,23 @@
-// litehtml document_container for PocketBook InkView (issue #3, phase 1).
+// litehtml document_container for PocketBook InkView (issue #3).
 #pragma once
 
 #include <litehtml.h>
 
+#include <map>
+#include <string>
+
+typedef struct ibitmap_s ibitmap;
+
+// Resolves an image src URL to a local file path (fetching/caching as
+// needed). Returns false if the image is unavailable.
+typedef bool (*PbImageResolver)(const char *src, char *path_out, int path_cap);
+
 class PbHtmlContainer : public litehtml::document_container {
 public:
     PbHtmlContainer(int width, int default_font_px);
+
+    void set_image_resolver(PbImageResolver fn) { m_resolver = fn; }
+    void clear_images();
 
     // Vertical offset applied to every draw call: the reading view scrolls
     // by rendering the laid-out document shifted by -scroll.
@@ -67,4 +79,6 @@ private:
     int m_offset_y = 0;
     int m_view_height = 1680;
     char m_clicked_url[256];
+    PbImageResolver m_resolver = NULL;
+    std::map<std::string, ibitmap *> m_images;  // NULL entries = failed loads
 };
