@@ -352,7 +352,8 @@ bool hit(const Zone &z, int x, int y)
 Zone z_sync, z_settings, z_back;
 Zone z_save, z_aa, z_next_article;
 Zone z_settings_feeds, z_settings_scrollmode, z_settings_listscroll,
-     z_settings_diagnostics, z_add_feed;
+     z_settings_hideread, z_settings_diagnostics, z_add_feed;
+Zone z_reveal_read;
 Zone z_feed_edit[LIST_ROWS], z_feed_delete[LIST_ROWS];
 Zone z_feed_name, z_feed_url, z_feed_editor_delete;
 const int MAX_LINK_ZONES = 12;
@@ -384,9 +385,41 @@ int feed_pages()
     return (feed_count + LIST_ROWS - 1) / LIST_ROWS;
 }
 
+// Hide-read setting (Settings > Read articles): article lists show only
+// unread rows plus a tappable "N read articles hidden" indicator row.
+// reveal_read temporarily shows everything for the current feed visit.
+bool hide_read = false;
+bool reveal_read = false;
+int visible_articles[MAX_FEED_ARTICLES];
+int visible_article_count = 0;
+int hidden_read_count = 0;
+
+void compute_visible_articles()
+{
+    const Feed &f = feeds[sel_feed];
+    visible_article_count = 0;
+    hidden_read_count = 0;
+    bool hiding = hide_read && !reveal_read;
+    for (int j = 0; j < f.count; ++j) {
+        if (hiding && !f.articles[j].unread) {
+            hidden_read_count++;
+            continue;
+        }
+        visible_articles[visible_article_count++] = j;
+    }
+}
+
+int article_list_items()  // visible rows plus the indicator row, if any
+{
+    compute_visible_articles();
+    return visible_article_count + (hidden_read_count > 0 ? 1 : 0);
+}
+
 int article_pages()
 {
-    return (feeds[sel_feed].count + LIST_ROWS - 1) / LIST_ROWS;
+    int items = article_list_items();
+    if (items < 1) items = 1;
+    return (items + LIST_ROWS - 1) / LIST_ROWS;
 }
 
 int feed_settings_pages()
@@ -819,6 +852,13 @@ void draw_feed_row(const Feed &f, int y, int w, char *buf, int buf_cap)
     rule(PAD, y + FEED_ROW_H - 2, w - PAD * 2, 2, C_RULE);
 }
 
+void draw_hidden_read_row(int y, int w, char *buf, int buf_cap)
+{
+    snprintf(buf, buf_cap, "\xE2\x80\x94 %d read article%s hidden \xE2\x80\x94",
+             hidden_read_count, hidden_read_count == 1 ? "" : "s");
+    text(f_meta_i, 0, y, w, ART_ROW_H, buf, ALIGN_CENTER | VALIGN_MIDDLE);
+}
+
 void draw_article_row(const Article &a, int y, int w, char *buf, int buf_cap)
 {
     // Unread marker: filled dot; read: ring.
@@ -930,30 +970,52 @@ void draw_articles()
          ALIGN_RIGHT | VALIGN_TOP);
     rule(PAD, 210, w - PAD * 2, 6);
 
-    if (list_scroll_mode) {
-        int top = 216;
-        int h = ScreenHeight();
+    compute_visible_articles();
+    z_reveal_read = (Zone){0, 0, 0, 0};
+    int items = visible_article_count + (hidden_read_count > 0 ? 1 : 0);
+    int top = 216;
+    int h = ScreenHeight();
+
+    if (visible_article_count == 0 && hidden_read_count > 0) {
+        // Everything read and hidden: centered empty state, tap to reveal.
+        int cy = top + (h - top) / 2;
+        text(f_row_b, PAD, cy - 70, w - PAD * 2, 52, "All caught up",
+             ALIGN_CENTER | VALIGN_TOP);
+        snprintf(buf, sizeof(buf), "%d read article%s hidden \xC2\xB7 tap to show",
+                 hidden_read_count, hidden_read_count == 1 ? "" : "s");
+        text(f_meta_i, PAD, cy + 8, w - PAD * 2, 36, buf,
+             ALIGN_CENTER | VALIGN_TOP);
+        z_reveal_read = (Zone){0, top, w, h - top};
+    } else if (list_scroll_mode) {
         int view_h = h - top;
-        int total = f.count * ART_ROW_H;
+        int total = items * ART_ROW_H;
         art_max_scroll = total - view_h;
         if (art_max_scroll < 0) art_max_scroll = 0;
         if (art_scroll > art_max_scroll) art_scroll = art_max_scroll;
         if (art_scroll < 0) art_scroll = 0;
 
         SetClip(0, top, w, view_h);
-        for (int idx = 0; idx < f.count; ++idx) {
+        for (int idx = 0; idx < items; ++idx) {
             int y = top - art_scroll + idx * ART_ROW_H;
             if (y + ART_ROW_H <= top || y >= h) continue;
-            draw_article_row(f.articles[idx], y, w, buf, sizeof(buf));
+            if (idx < visible_article_count)
+                draw_article_row(f.articles[visible_articles[idx]], y, w,
+                                 buf, sizeof(buf));
+            else
+                draw_hidden_read_row(y, w, buf, sizeof(buf));
         }
         SetClip(0, 0, w, h);
         draw_scrollbar(top, view_h, total, art_scroll);
     } else {
         for (int i = 0; i < LIST_ROWS; ++i) {
             int idx = art_page * LIST_ROWS + i;
-            if (idx >= f.count) break;
-            draw_article_row(f.articles[idx], 216 + i * ART_ROW_H, w,
-                             buf, sizeof(buf));
+            if (idx >= items) break;
+            int y = top + i * ART_ROW_H;
+            if (idx < visible_article_count)
+                draw_article_row(f.articles[visible_articles[idx]], y, w,
+                                 buf, sizeof(buf));
+            else
+                draw_hidden_read_row(y, w, buf, sizeof(buf));
         }
         draw_list_footer(art_page, article_pages());
     }
@@ -1011,6 +1073,19 @@ void draw_settings()
          ALIGN_RIGHT | VALIGN_MIDDLE);
     rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
     z_settings_listscroll = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_40_b, PAD, y + 32, w - PAD * 2 - 320, 52,
+         "Read articles", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 92, w - PAD * 2 - 320, 36,
+         hide_read ? "Article lists only show unread articles"
+                   : "Read articles appear in article lists",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 300, y, 300, ART_ROW_H,
+         hide_read ? "Hidden" : "Shown",
+         ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_settings_hideread = (Zone){0, y, w, ART_ROW_H};
 
     y += ART_ROW_H;
     text(f_40_b, PAD, y + 32, w - PAD * 2 - 120, 52,
@@ -1439,8 +1514,12 @@ void next_article()
 void back_to_article_list()
 {
     view = VIEW_ARTICLES;
-    art_page = sel_article / LIST_ROWS;
-    art_scroll = sel_article * ART_ROW_H;
+    compute_visible_articles();
+    int pos = 0;
+    for (int i = 0; i < visible_article_count; ++i)
+        if (visible_articles[i] <= sel_article) pos = i;
+    art_page = pos / LIST_ROWS;
+    art_scroll = pos * ART_ROW_H;
     draw_screen();
 }
 
@@ -1475,6 +1554,7 @@ void open_next_unread_feed()
             sel_feed = idx;
             art_page = 0;
             art_scroll = 0;
+            reveal_read = false;
             view = VIEW_ARTICLES;
             draw_screen();
             return;
@@ -2242,6 +2322,13 @@ void save_state()
     }
 
     if (ok && sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO meta VALUES('hideread',?1)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, hide_read ? "1" : "0", -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+
+    if (ok && sqlite3_prepare_v2(db,
             "INSERT INTO feeds VALUES(?1,?2,?3)", -1, &st, NULL) == SQLITE_OK) {
         for (int i = 0; ok && i < feed_count; ++i) {
             sqlite3_reset(st);
@@ -2312,6 +2399,15 @@ bool load_state()
         if (sqlite3_step(st) == SQLITE_ROW) {
             const unsigned char *v = sqlite3_column_text(st, 0);
             list_scroll_mode = v && v[0] == '1';
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='hideread'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *v = sqlite3_column_text(st, 0);
+            hide_read = v && v[0] == '1';
         }
         sqlite3_finalize(st);
     }
@@ -2782,6 +2878,7 @@ void handle_tap(int x, int y)
                 sel_feed = feed_order[idx];
                 art_page = 0;
                 art_scroll = 0;
+                reveal_read = false;
                 view = VIEW_ARTICLES;
                 draw_screen();
             }
@@ -2797,13 +2894,24 @@ void handle_tap(int x, int y)
             return;
         }
         if (y >= 216) {
-            int idx = list_scroll_mode
+            compute_visible_articles();
+            if (hit(z_reveal_read, x, y)) {
+                reveal_read = true;
+                art_page = 0;
+                art_scroll = 0;
+                draw_screen();
+                return;
+            }
+            int row = list_scroll_mode
                           ? (y - 216 + art_scroll) / ART_ROW_H
                           : art_page * LIST_ROWS + (y - 216) / ART_ROW_H;
             if (!list_scroll_mode && (y - 216) / ART_ROW_H >= LIST_ROWS)
                 return;
-            if (idx >= 0 && idx < feeds[sel_feed].count) {
-                open_article(sel_feed, idx);
+            if (row >= 0 && row < visible_article_count) {
+                open_article(sel_feed, visible_articles[row]);
+                draw_screen();
+            } else if (row == visible_article_count && hidden_read_count > 0) {
+                reveal_read = true;
                 draw_screen();
             }
         }
@@ -2825,6 +2933,13 @@ void handle_tap(int x, int y)
             list_scroll_mode = !list_scroll_mode;
             feed_scroll = art_scroll = 0;
             feed_page = art_page = 0;
+            save_state();
+            draw_screen();
+        } else if (hit(z_settings_hideread, x, y)) {
+            hide_read = !hide_read;
+            reveal_read = false;
+            art_page = 0;
+            art_scroll = 0;
             save_state();
             draw_screen();
         } else if (hit(z_settings_diagnostics, x, y)) {
