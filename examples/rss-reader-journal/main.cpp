@@ -269,9 +269,23 @@ ibitmap *feed_icons[MAX_FEEDS];        // decoded tiles, lazy
 bool feed_icon_failed[MAX_FEEDS];      // per-session negative cache
 char keyboard_buffer[160];
 int keyboard_feed_idx = -1;
-int keyboard_mode = 0; // 1 name, 2 URL
+int keyboard_mode = 0; // 1 name, 2 URL, 3 Feedly search
 int feed_settings_page = 0;
 int editing_feed_idx = -1;
+int pending_delete_feed_idx = -1;
+bool pending_delete_from_editor = false;
+
+const int MAX_FEED_SEARCH_RESULTS = LIST_ROWS;
+struct FeedSearchResult {
+    char title[100];
+    char url[180];
+    char website[160];
+    int subscribers;
+};
+FeedSearchResult feed_search_results[MAX_FEED_SEARCH_RESULTS];
+int feed_search_count = 0;
+char feed_search_query[80] = "";
+char feed_search_status[180] = "Search Feedly for a topic or feed name.";
 
 const int MAX_FEED_ARTICLES = 20;
 const int MAX_FEED_BYTES = 512 * 1024;
@@ -308,7 +322,7 @@ bool saved[MAX_FEEDS][32];  // per feed, per article; sized above feeds/articles
 
 // ---------------------------------------------------------------- state ---
 
-enum View { VIEW_FEEDS, VIEW_ARTICLES, VIEW_READING, VIEW_SETTINGS, VIEW_FEED_SETTINGS, VIEW_FEED_EDITOR, VIEW_DIAGNOSTICS };
+enum View { VIEW_FEEDS, VIEW_ARTICLES, VIEW_READING, VIEW_SETTINGS, VIEW_FEED_SETTINGS, VIEW_FEED_EDITOR, VIEW_FEED_SEARCH, VIEW_DIAGNOSTICS };
 
 View view = VIEW_FEEDS;
 int feed_page = 0;
@@ -379,6 +393,7 @@ Zone z_settings_feeds, z_settings_scrollmode, z_settings_listscroll,
 Zone z_reveal_read;
 Zone z_feed_edit[LIST_ROWS], z_feed_delete[LIST_ROWS];
 Zone z_feed_name, z_feed_url, z_feed_editor_delete;
+Zone z_feed_search_again, z_feed_search_result[LIST_ROWS];
 const int MAX_LINK_ZONES = 12;
 Zone z_body_links[MAX_LINK_ZONES];
 char z_body_link_urls[MAX_LINK_ZONES][256];
@@ -588,6 +603,7 @@ const char *view_name()
     if (view == VIEW_SETTINGS) return "settings";
     if (view == VIEW_FEED_SETTINGS) return "feed-settings";
     if (view == VIEW_FEED_EDITOR) return "feed-editor";
+    if (view == VIEW_FEED_SEARCH) return "feed-search";
     return "diagnostics";
 }
 
@@ -1585,6 +1601,63 @@ void draw_feed_editor()
     FullUpdate();
 }
 
+void draw_feed_search()
+{
+    int w = ScreenWidth();
+    char buf[220];
+
+    ClearScreen();
+
+    text(f_nav, PAD, PAD, 600, 38, "\xE2\x80\xB9 Feeds",
+         ALIGN_LEFT | VALIGN_TOP);
+    z_back = (Zone){0, 0, 700, 216};
+    text(f_h2_b, PAD, 122, w - PAD * 2, 64, "Add feed",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, w - PAD - 520, 168, 520, 36,
+         "Search powered by Feedly", ALIGN_RIGHT | VALIGN_TOP);
+    rule(PAD, 210, w - PAD * 2, 6);
+
+    int y = 216;
+    text(f_40_b, PAD, y + 28, w - PAD * 2 - 80, 52,
+         "Search topic or feed name", ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_meta_i, PAD, y + 88, w - PAD * 2 - 80, 36,
+         feed_search_query[0] ? feed_search_query : "Tap to search Feedly",
+         ALIGN_LEFT | VALIGN_TOP | DOTS);
+    text(f_nav, w - PAD - 80, y, 80, ART_ROW_H,
+         "\xE2\x80\xBA", ALIGN_RIGHT | VALIGN_MIDDLE);
+    rule(PAD, y + ART_ROW_H - 2, w - PAD * 2, 2);
+    z_feed_search_again = (Zone){0, y, w, ART_ROW_H};
+
+    y += ART_ROW_H;
+    text(f_meta_i, PAD, y + 20, w - PAD * 2, 42,
+         feed_search_status, ALIGN_LEFT | VALIGN_TOP | DOTS);
+    y += 74;
+
+    for (int i = 0; i < LIST_ROWS; ++i) z_feed_search_result[i] = (Zone){0, 0, 0, 0};
+    for (int i = 0; i < feed_search_count && i < LIST_ROWS; ++i) {
+        FeedSearchResult &r = feed_search_results[i];
+        int row_y = y + i * ART_ROW_H;
+        text(f_40_b, PAD, row_y + 18, w - PAD * 2 - 110, 50,
+             r.title, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        if (r.subscribers > 0)
+            snprintf(buf, sizeof(buf), "%s \xC2\xB7 %d subscriber%s",
+                     r.website[0] ? r.website : r.url,
+                     r.subscribers, r.subscribers == 1 ? "" : "s");
+        else
+            snprintf(buf, sizeof(buf), "%s", r.website[0] ? r.website : r.url);
+        text(f_meta_i, PAD, row_y + 72, w - PAD * 2 - 110, 36,
+             buf, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        text(f_hint_i, PAD, row_y + 112, w - PAD * 2 - 110, 32,
+             r.url, ALIGN_LEFT | VALIGN_TOP | DOTS);
+        text(f_nav, w - PAD - 90, row_y, 90, ART_ROW_H,
+             "Add", ALIGN_RIGHT | VALIGN_MIDDLE);
+        z_feed_search_result[i] = (Zone){0, row_y, w, ART_ROW_H};
+        rule(PAD, row_y + ART_ROW_H - 2, w - PAD * 2, 2);
+    }
+
+    FullUpdate();
+}
+
 // Shared reading footer: Save | Aa | <center label> | Next article ›
 void draw_reading_footer(const char *center)
 {
@@ -1917,6 +1990,7 @@ void draw_screen()
     else if (view == VIEW_SETTINGS) draw_settings();
     else if (view == VIEW_FEED_SETTINGS) draw_feed_settings();
     else if (view == VIEW_FEED_EDITOR) draw_feed_editor();
+    else if (view == VIEW_FEED_SEARCH) draw_feed_search();
     else draw_diagnostics();
 }
 
@@ -3206,6 +3280,248 @@ bool ensure_network_connected()
     return rc == NET_OK;
 }
 
+void url_encode(char *dst, int cap, const char *src)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int out = 0;
+    for (const unsigned char *p = (const unsigned char *)src;
+         *p && out + 1 < cap; ++p) {
+        unsigned char c = *p;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[out++] = (char)c;
+        } else if (c == ' ') {
+            dst[out++] = '+';
+        } else if (out + 3 < cap) {
+            dst[out++] = '%';
+            dst[out++] = hex[c >> 4];
+            dst[out++] = hex[c & 15];
+        }
+    }
+    dst[out] = 0;
+}
+
+const char *json_object_end(const char *open)
+{
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    for (const char *p = open; *p; ++p) {
+        if (escape) { escape = false; continue; }
+        if (in_string) {
+            if (*p == '\\') escape = true;
+            else if (*p == '"') in_string = false;
+            continue;
+        }
+        if (*p == '"') in_string = true;
+        else if (*p == '{') depth++;
+        else if (*p == '}' && --depth == 0) return p + 1;
+    }
+    return NULL;
+}
+
+void json_copy_string(char *dst, int cap, const char *start, const char *end)
+{
+    char *w = dst;
+    char *limit = dst + cap - 1;
+    for (const char *p = start; p < end && w < limit; ++p) {
+        if (*p != '\\') {
+            *w++ = *p;
+            continue;
+        }
+        if (++p >= end) break;
+        if (*p == 'n' || *p == 'r' || *p == 't') *w++ = ' ';
+        else if (*p == '"' || *p == '\\' || *p == '/') *w++ = *p;
+        else if (*p == 'u' && p + 4 < end) {
+            char hex[5] = {p[1], p[2], p[3], p[4], 0};
+            unsigned code = (unsigned)strtoul(hex, NULL, 16);
+            char tmp[4];
+            char *tw = tmp;
+            append_utf8(&tw, code);
+            for (char *r = tmp; r < tw && w < limit; ++r) *w++ = *r;
+            p += 4;
+        }
+    }
+    *w = 0;
+    copy_trimmed(dst, cap, dst);
+}
+
+bool json_get_string(const char *obj, const char *obj_end, const char *key,
+                     char *out, int cap)
+{
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = obj;
+    while ((p = strstr(p, pat)) && p < obj_end) {
+        p += strlen(pat);
+        while (p < obj_end && isspace((unsigned char)*p)) p++;
+        if (p >= obj_end || *p != ':') continue;
+        p++;
+        while (p < obj_end && isspace((unsigned char)*p)) p++;
+        if (p >= obj_end || *p != '"') continue;
+        const char *start = ++p;
+        bool escape = false;
+        while (p < obj_end) {
+            if (escape) escape = false;
+            else if (*p == '\\') escape = true;
+            else if (*p == '"') break;
+            p++;
+        }
+        if (p >= obj_end) return false;
+        json_copy_string(out, cap, start, p);
+        return true;
+    }
+    out[0] = 0;
+    return false;
+}
+
+int json_get_int(const char *obj, const char *obj_end, const char *key)
+{
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(obj, pat);
+    if (!p || p >= obj_end) return 0;
+    p += strlen(pat);
+    while (p < obj_end && *p != ':') p++;
+    if (p >= obj_end) return 0;
+    p++;
+    while (p < obj_end && isspace((unsigned char)*p)) p++;
+    return atoi(p);
+}
+
+int parse_feedly_results(const char *json)
+{
+    feed_search_count = 0;
+    const char *results = strstr(json, "\"results\"");
+    if (!results) return 0;
+    const char *p = strchr(results, '[');
+    if (!p) return 0;
+    p++;
+
+    while (*p && feed_search_count < MAX_FEED_SEARCH_RESULTS) {
+        while (*p && *p != '{' && *p != ']') p++;
+        if (*p != '{') break;
+        const char *end = json_object_end(p);
+        if (!end) break;
+
+        char feed_id[220];
+        if (json_get_string(p, end, "feedId", feed_id, sizeof(feed_id))) {
+            FeedSearchResult &r = feed_search_results[feed_search_count];
+            memset(&r, 0, sizeof(r));
+            const char *url = !strncmp(feed_id, "feed/", 5) ? feed_id + 5 : feed_id;
+            snprintf(r.url, sizeof(r.url), "%s", url);
+            json_get_string(p, end, "title", r.title, sizeof(r.title));
+            json_get_string(p, end, "website", r.website, sizeof(r.website));
+            r.subscribers = json_get_int(p, end, "subscribers");
+            if (!r.title[0]) snprintf(r.title, sizeof(r.title), "%s", r.url);
+            if (!strncmp(r.url, "http://", 7) || !strncmp(r.url, "https://", 8))
+                feed_search_count++;
+        }
+        p = end;
+    }
+    return feed_search_count;
+}
+
+void search_feedly(const char *query)
+{
+    feed_search_count = 0;
+    if (!query || !*query) {
+        snprintf(feed_search_status, sizeof(feed_search_status),
+                 "Enter a topic or feed name to search Feedly.");
+        return;
+    }
+    if (!ensure_network_connected()) {
+        snprintf(feed_search_status, sizeof(feed_search_status),
+                 "No network connection. Connect to Wi-Fi and try again.");
+        return;
+    }
+
+    char *scratch = (char *)malloc(MAX_FEED_BYTES);
+    if (!scratch) {
+        snprintf(feed_search_status, sizeof(feed_search_status),
+                 "Not enough memory to search.");
+        return;
+    }
+
+    char enc[240];
+    char url[360];
+    char error[96] = "";
+    url_encode(enc, sizeof(enc), query);
+    snprintf(url, sizeof(url),
+             "https://cloud.feedly.com/v3/search/feeds?q=%s&n=%d",
+             enc, MAX_FEED_SEARCH_RESULTS);
+    if (fetch_url(url, scratch, MAX_FEED_BYTES, error, sizeof(error))) {
+        int n = parse_feedly_results(scratch);
+        snprintf(feed_search_status, sizeof(feed_search_status),
+                 n > 0 ? "Select a result to add it." : "No Feedly results found.");
+    } else {
+        snprintf(feed_search_status, sizeof(feed_search_status),
+                 "Feedly search failed: %s", error);
+    }
+    free(scratch);
+}
+
+void feed_keyboard_done(char *text);
+
+void start_feed_search_keyboard()
+{
+    keyboard_mode = 3;
+    keyboard_feed_idx = -1;
+    snprintf(keyboard_buffer, sizeof(keyboard_buffer), "%s", feed_search_query);
+    OpenKeyboard("Search Feedly", keyboard_buffer, sizeof(keyboard_buffer),
+                 KBD_NORMAL, feed_keyboard_done);
+}
+
+void open_feed_search()
+{
+    feed_search_count = 0;
+    feed_search_query[0] = 0;
+    snprintf(feed_search_status, sizeof(feed_search_status),
+             "Search Feedly for a topic or feed name.");
+    view = VIEW_FEED_SEARCH;
+    draw_screen();
+}
+
+bool feed_already_added(const char *url)
+{
+    for (int i = 0; i < feed_count; ++i)
+        if (!strcmp(feeds[i].url, url)) return true;
+    return false;
+}
+
+void add_search_result(int result_idx)
+{
+    if (result_idx < 0 || result_idx >= feed_search_count) return;
+    if (feed_count >= MAX_FEEDS) {
+        Message(ICON_INFORMATION, (char *)"Feeds",
+                (char *)"This build has reached its feed limit.", 2000);
+        return;
+    }
+
+    FeedSearchResult &r = feed_search_results[result_idx];
+    if (feed_already_added(r.url)) {
+        Message(ICON_INFORMATION, (char *)"Feed already added",
+                (char *)r.title, 2500);
+        return;
+    }
+
+    int idx = feed_count++;
+    reset_feed_icon(idx);
+    feed_icon_urls[idx][0] = 0;
+    snprintf(feed_name_buffers[idx], sizeof(feed_name_buffers[idx]), "%s", r.title);
+    snprintf(feed_url_buffers[idx], sizeof(feed_url_buffers[idx]), "%s", r.url);
+    added_articles[idx] = (Article){"Welcome to your new feed",
+                                    "Not synced yet", true, BODY_SAMPLE};
+    feeds[idx] = (Feed){feed_name_buffers[idx], feed_url_buffers[idx],
+                        &added_articles[idx], 1};
+    memset(saved[idx], 0, sizeof(saved[idx]));
+    feed_settings_page = (feed_count - 1) / LIST_ROWS;
+    save_state();
+    view = VIEW_FEED_SETTINGS;
+    draw_screen();
+    Message(ICON_INFORMATION, (char *)"Feed added",
+            (char *)"Sync to fetch articles.", 2500);
+}
+
 // Draws a non-modal sync progress bar in the footer strip, matching the
 // Journal design: 2px rule, italic status line, black outlined bar.
 void draw_sync_progress(int done, int total, const char *name)
@@ -3305,6 +3621,25 @@ void update_feed_url(int idx, const char *url)
 
 void feed_keyboard_done(char *text)
 {
+    if (keyboard_mode == 3) {
+        if (text && *text) {
+            snprintf(feed_search_query, sizeof(feed_search_query), "%s", text);
+            snprintf(feed_search_status, sizeof(feed_search_status),
+                     "Searching Feedly...");
+            keyboard_mode = 0;
+            keyboard_feed_idx = -1;
+            view = VIEW_FEED_SEARCH;
+            draw_screen();
+            search_feedly(feed_search_query);
+            draw_screen();
+            return;
+        }
+        keyboard_mode = 0;
+        keyboard_feed_idx = -1;
+        draw_screen();
+        return;
+    }
+
     if (text && *text) {
         if (keyboard_mode == 1) rename_feed(keyboard_feed_idx, text);
         else if (keyboard_mode == 2) update_feed_url(keyboard_feed_idx, text);
@@ -3349,22 +3684,7 @@ void add_feed()
                 (char *)"This build has reached its feed limit.", 2000);
         return;
     }
-
-    int idx = feed_count++;
-    feed_icon_urls[idx][0] = 0;
-    if (feed_icons[idx]) free(feed_icons[idx]);
-    feed_icons[idx] = NULL;
-    feed_icon_failed[idx] = false;
-    snprintf(feed_name_buffers[idx], sizeof(feed_name_buffers[idx]), "New feed");
-    snprintf(feed_url_buffers[idx], sizeof(feed_url_buffers[idx]),
-             "https://example.com/feed.xml");
-    added_articles[idx] = (Article){"Welcome to your new feed",
-                                    "Not synced yet", true, BODY_SAMPLE};
-    feeds[idx] = (Feed){feed_name_buffers[idx], feed_url_buffers[idx],
-                        &added_articles[idx], 1};
-    memset(saved[idx], 0, sizeof(saved[idx]));
-    feed_settings_page = (feed_count - 1) / LIST_ROWS;
-    edit_feed(idx);
+    open_feed_search();
 }
 
 void delete_feed(int idx)
@@ -3404,6 +3724,40 @@ void delete_feed(int idx)
     if (feed_settings_page < 0) feed_settings_page = 0;
     save_state();
     draw_screen();
+}
+
+void confirm_delete_feed(int button)
+{
+    int idx = pending_delete_feed_idx;
+    bool from_editor = pending_delete_from_editor;
+    pending_delete_feed_idx = -1;
+    pending_delete_from_editor = false;
+
+    if (button != 2 || idx < 0 || idx >= feed_count) {
+        draw_screen();
+        return;
+    }
+
+    if (from_editor) view = VIEW_FEED_SETTINGS;
+    delete_feed(idx);
+}
+
+void request_delete_feed(int idx)
+{
+    if (idx < 0 || idx >= feed_count) return;
+    if (feed_count <= 1) {
+        Message(ICON_INFORMATION, (char *)"Feeds",
+                (char *)"Keep at least one feed.", 2000);
+        return;
+    }
+
+    char text[220];
+    snprintf(text, sizeof(text), "Delete \"%s\"?\n\nThis removes the feed and cached articles from this reader.",
+             feeds[idx].name);
+    pending_delete_feed_idx = idx;
+    pending_delete_from_editor = view == VIEW_FEED_EDITOR;
+    Dialog(ICON_QUESTION, "Delete feed", text, "Cancel", "Delete",
+           confirm_delete_feed);
 }
 
 void open_url(const char *url)
@@ -3538,7 +3892,8 @@ void page_delta(int d)
         } else if (d < 0) {
             go_back();
         }
-    } else if (view == VIEW_FEED_EDITOR || view == VIEW_DIAGNOSTICS) {
+    } else if (view == VIEW_FEED_EDITOR || view == VIEW_FEED_SEARCH ||
+               view == VIEW_DIAGNOSTICS) {
         if (d < 0) go_back();
     } else if (scroll_mode) {
         if (d > 0) open_next_unread_article();
@@ -3570,7 +3925,7 @@ void go_back()
     } else if (view == VIEW_FEED_SETTINGS) {
         view = VIEW_SETTINGS;
         draw_screen();
-    } else if (view == VIEW_FEED_EDITOR) {
+    } else if (view == VIEW_FEED_EDITOR || view == VIEW_FEED_SEARCH) {
         view = VIEW_FEED_SETTINGS;
         draw_screen();
     } else if (view == VIEW_DIAGNOSTICS) {
@@ -3707,7 +4062,7 @@ void handle_tap(int x, int y)
         for (int i = 0; i < LIST_ROWS; ++i) {
             int idx = feed_settings_page * LIST_ROWS + i;
             if (idx >= feed_count) break;
-            if (hit(z_feed_delete[i], x, y)) { delete_feed(idx); return; }
+            if (hit(z_feed_delete[i], x, y)) { request_delete_feed(idx); return; }
             if (hit(z_feed_edit[i], x, y)) { edit_feed(idx); return; }
         }
         return;
@@ -3718,9 +4073,17 @@ void handle_tap(int x, int y)
         if (hit(z_feed_name, x, y)) { edit_feed_name(); return; }
         if (hit(z_feed_url, x, y)) { edit_feed_url(); return; }
         if (hit(z_feed_editor_delete, x, y)) {
-            view = VIEW_FEED_SETTINGS;
-            delete_feed(editing_feed_idx);
+            request_delete_feed(editing_feed_idx);
             return;
+        }
+        return;
+    }
+
+    if (view == VIEW_FEED_SEARCH) {
+        if (hit(z_back, x, y)) { go_back(); return; }
+        if (hit(z_feed_search_again, x, y)) { start_feed_search_keyboard(); return; }
+        for (int i = 0; i < feed_search_count && i < LIST_ROWS; ++i) {
+            if (hit(z_feed_search_result[i], x, y)) { add_search_result(i); return; }
         }
         return;
     }
