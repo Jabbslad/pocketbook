@@ -33,3 +33,10 @@ Expected output:
 - Prefer direct InkView calls such as `InkViewMain`, `EVT_INIT`, `ClearScreen`, `DrawTextRect`, `FullUpdate`, and `CloseApp`.
 - Verify changes by building a `.app` where practical; runtime verification requires a connected PocketBook device.
 - Do not replace this approach with Go, KOReader plugins, or shell-script apps unless the user asks for that specifically.
+
+## Implementation learnings
+- The SDK toolchain supplies `PB_LINK_DIRECTORIES`, `PB_INCLUDE_DIRECTORIES`, and the other PocketBook build variables; do not derive unused tools such as `PBRES` in an app CMake file.
+- Minimize unnecessary e-ink work: avoid redundant full-screen clears when every active draw path already paints its complete screen, and reuse precomputed text measurements during rendering.
+- Base pagination on the items actually shown after filtering rather than on the feed's unfiltered article count.
+- Keep article image memory bounded by clearing the litehtml image cache at the start of every document build, including builds that exit early when scroll mode is disabled. Composite grayscale-alpha images over white while downscaling instead of allocating a second full-size image buffer.
+- When changing shared example or build behavior, build every affected `.app` with its Docker helper. Syntax-check changed POSIX shell scripts with `sh -n`.
