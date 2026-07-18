@@ -4,8 +4,6 @@ cmake_minimum_required(VERSION 3.21)
 include("${CMAKE_TOOLCHAIN_FILE}")
 project(rss_reader_journal C CXX)
 
-string(REGEX REPLACE "[^/]+$" "pbres" PBRES "${CMAKE_C_COMPILER}")
-
 link_directories("${PB_LINK_DIRECTORIES}")
 include_directories("${PB_INCLUDE_DIRECTORIES}")
 include_directories("${FREETYPE_INCLUDE_DIRS}")
@@ -19,6 +17,7 @@ add_executable(rss-reader-journal main.cpp litehtml_container.cpp)
 target_include_directories(rss-reader-journal PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/litehtml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb")
-set_target_properties(rss-reader-journal PROPERTIES CXX_STANDARD 11)
-set_target_properties(rss-reader-journal PROPERTIES OUTPUT_NAME "rss-reader-journal.app")
+set_target_properties(rss-reader-journal PROPERTIES
+    CXX_STANDARD 11
+    OUTPUT_NAME "rss-reader-journal.app")
 target_link_libraries(rss-reader-journal inkview litehtml xml2 z lzma sqlite3 dl m)

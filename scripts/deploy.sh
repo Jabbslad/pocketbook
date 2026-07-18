@@ -80,7 +80,7 @@ fi
 
 if [ -z "$apps_dir" ]; then
   candidates=$(find_applications_dir)
-  count=$(printf '%s\n' "$candidates" | sed '/^$/d' | wc -l | tr -d ' ')
+  count=$(printf '%s\n' "$candidates" | awk 'NF { count++ } END { print count + 0 }')
 
   if [ "$count" -eq 0 ]; then
     echo "Could not find a writable PocketBook applications directory." >&2

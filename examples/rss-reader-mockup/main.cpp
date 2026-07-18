@@ -401,7 +401,6 @@ void draw_settings()
 
 void draw_screen()
 {
-    ClearScreen();
     if (view == 0) {
         draw_home();
     } else if (view == 1) {
@@ -443,12 +442,6 @@ void open_fonts()
     font_meta = OpenFont("LiberationSans", meta_sizes[ui_size], 1);
 }
 
-void update_fonts()
-{
-    close_fonts();
-    open_fonts();
-}
-
 void change_selected_setting(int delta)
 {
     int *value = selected_setting == 0 ? &ui_size : &article_size;
@@ -459,7 +452,8 @@ void change_selected_setting(int delta)
 
     if (next != *value) {
         *value = next;
-        update_fonts();
+        close_fonts();
+        open_fonts();
     }
 }
 
@@ -520,9 +514,10 @@ void handle_tap(int x, int y)
         int row_top = content_top() + 118;
         int row_h = 136;
         int row_gap = 14;
+        int rows = inbox_rows_per_page();
         int row = (y - row_top) / (row_h + row_gap);
-        int index = inbox_page * inbox_rows_per_page() + row;
-        if (y >= row_top && row >= 0 && row < inbox_rows_per_page() && index < article_count) {
+        int index = inbox_page * rows + row;
+        if (y >= row_top && row >= 0 && row < rows && index < article_count) {
             selected_article = index;
             view = 2;
         }
@@ -612,7 +607,7 @@ int main_handler(int event_type, int param_one, int param_two)
 
 } // namespace
 
-int main(int argc, char **argv)
+int main()
 {
     InkViewMain(main_handler);
     return 0;

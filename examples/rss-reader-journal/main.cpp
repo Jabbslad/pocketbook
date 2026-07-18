@@ -321,7 +321,7 @@ Feed feeds[MAX_FEEDS] = {
 };
 int feed_count = 10;
 
-bool saved[MAX_FEEDS][32];  // per feed, per article; sized above feeds/articles
+bool saved[MAX_FEEDS][MAX_FEED_ARTICLES];
 
 // ---------------------------------------------------------------- state ---
 
@@ -948,14 +948,8 @@ const int PINNED_ROWS = 2;  // 0 = Starred Articles, 1 = All Articles
 
 ibitmap *feed_icon_bitmap(int idx);
 
-// 88px icon tile area; contents are centered without a border.
-void draw_icon_tile_frame(int, int)
-{
-}
-
 void draw_monogram_tile(int x, int y, const char *name)
 {
-    draw_icon_tile_frame(x, y);
     char letter[2] = {'#', 0};
     for (const char *p = name; *p; ++p) {
         if (isalnum((unsigned char)*p)) {
@@ -1004,7 +998,6 @@ void draw_pinned_feed_row(int which, int y, int w, char *buf, int buf_cap)
     pinned_row_stats(which, &count, &has_unread, &latest);
 
     int tile_y = y + (FEED_ROW_H - 88) / 2 - 1;
-    draw_icon_tile_frame(PAD, tile_y);
     if (which == 0) {
         draw_star(PAD + 44, tile_y + 44, 26, true);
     } else {
@@ -1037,7 +1030,6 @@ void draw_feed_row(int fidx, int y, int w, char *buf, int buf_cap)
     int tile_y = y + (FEED_ROW_H - 88) / 2 - 1;
     ibitmap *icon = feed_icon_bitmap(fidx);
     if (icon) {
-        draw_icon_tile_frame(PAD, tile_y);
         DrawBitmap(PAD + (88 - icon->width) / 2,
                    tile_y + (88 - icon->height) / 2, icon);
     } else {
@@ -1220,7 +1212,6 @@ void draw_articles()
         // Icon tile beside the feed name, matching the feeds screen.
         int tile_y = 116;
         if (virt) {
-            draw_icon_tile_frame(PAD, tile_y);
             if (vfeed_mode == VMODE_STARRED) {
                 draw_star(PAD + 44, tile_y + 44, 26, true);
             } else {
@@ -1230,7 +1221,6 @@ void draw_articles()
         } else {
             ibitmap *icon = feed_icon_bitmap(sel_feed);
             if (icon) {
-                draw_icon_tile_frame(PAD, tile_y);
                 DrawBitmap(PAD + (88 - icon->width) / 2,
                            tile_y + (88 - icon->height) / 2, icon);
             } else {
@@ -1321,7 +1311,8 @@ void draw_articles()
                 draw_hidden_read_row(y, w, buf, sizeof(buf));
             }
         }
-        draw_list_footer(art_page, article_pages());
+        int pages = items < 1 ? 1 : (items + LIST_ROWS - 1) / LIST_ROWS;
+        draw_list_footer(art_page, pages);
     }
     if (content_only) {
         DynamicUpdateBW(0, top, w, h - top);
@@ -1724,6 +1715,7 @@ void build_lit_doc()
 {
     lit_doc = nullptr;
     lit_doc_height = 0;
+    if (lit_container) lit_container->clear_images();
     if (!scroll_mode) return;
     const Feed &f = feeds[sel_feed];
     const Article &a = f.articles[sel_article];
@@ -1736,7 +1728,6 @@ void build_lit_doc()
     }
     lit_container->set_default_font_px(body_sizes[body_size_idx]);
     lit_container->set_view_height(ScreenHeight());
-    lit_container->clear_images();  // keep decoded images bounded per article
 
     static char html[RAW_BUF + 1024];
     snprintf(html, sizeof(html),
@@ -1892,13 +1883,7 @@ void draw_reading_scrolled()
     }
     SetClip(0, 0, w, h);
 
-    if (reading_bar_visible) {
-        FillArea(0, 0, w, READ_BAR_H, C_RULE);
-        long done = total <= avail ? total : (long)read_scroll + avail;
-        int fill_w = (int)((long long)w * done / (total > 0 ? total : 1));
-        if (fill_w > w) fill_w = w;
-        if (fill_w > 0) FillArea(0, 0, fill_w, READ_BAR_H, C_BLACK);
-    }
+    if (reading_bar_visible) draw_reading_progress_bar(total, avail);
 
     if (content_only) {
         DynamicUpdateBW(0, 0, w, h);
@@ -1933,9 +1918,9 @@ void draw_reading_paginated()
         snprintf(buf, sizeof(buf), "%s \xC2\xB7 %s", f.name, a.meta);
         text(f_meta_i, READ_PAD, PAD, cw, 36, buf, ALIGN_LEFT | VALIGN_TOP);
         SetFont(f_title_b, C_BLACK);
-        int th = TextRectHeight(cw, (char *)a.title, ALIGN_LEFT);
-        text(f_title_b, READ_PAD, 126, cw, th, a.title, ALIGN_LEFT | VALIGN_TOP);
-        rule(READ_PAD, 126 + th + 24, cw, 3);
+        text(f_title_b, READ_PAD, 126, cw, read_title_h, a.title,
+             ALIGN_LEFT | VALIGN_TOP);
+        rule(READ_PAD, 126 + read_title_h + 24, cw, 3);
         y = read_body_top;
     } else {
         y = PAD;
@@ -1943,7 +1928,7 @@ void draw_reading_paginated()
 
     body_link_zone_count = 0;
     SetFont(f_body, C_BLACK);
-    int line_h = TextRectHeight(cw, (char *)"Ag", ALIGN_LEFT);
+    int line_h = read_line_h;
     for (int i = page_start[read_page]; i < page_start[read_page + 1]; ++i) {
         char url[256];
         bool is_link = is_link_paragraph(paras[i], url, sizeof(url));
@@ -1957,7 +1942,7 @@ void draw_reading_paginated()
                                line_h + 20, url);
             y += line_h + PARA_GAP;
         } else {
-            int ph = TextRectHeight(cw, (char *)paras[i], ALIGN_LEFT);
+            int ph = para_h[i];
             DrawTextRect(READ_PAD, y, cw, ph, (char *)paras[i],
                          ALIGN_LEFT | VALIGN_TOP);
             y += ph + PARA_GAP;
@@ -2803,7 +2788,7 @@ time_t parse_feed_date(const char *s)
 
 // Meta line in the Journal style: "Today 07:15 · 9 min read",
 // "Yesterday · 3 min read", "Jul 2 · 11 min read".
-void format_meta(const char *raw_date, const char *body, char *out, int cap)
+void format_meta(time_t t, const char *body, char *out, int cap)
 {
     int words = 0;
     bool in_word = false;
@@ -2814,7 +2799,6 @@ void format_meta(const char *raw_date, const char *body, char *out, int cap)
     int mins = words / 180;
     if (mins < 1) mins = 1;
 
-    time_t t = parse_feed_date(raw_date);
     if (!t) {
         snprintf(out, cap, "%d min read", mins);
         return;
@@ -2853,7 +2837,8 @@ void commit_feed_item(FeedArticleStore &store, int *count,
     int idx = (*count)++;
     copy_trimmed(store.titles[idx], TITLE_BUF, *title ? title : "Untitled article");
     strip_markup(store.bodies[idx], BODY_BUF, *desc ? desc : link);
-    format_meta(date, store.bodies[idx], store.metas[idx], META_BUF);
+    time_t when = parse_feed_date(date);
+    format_meta(when, store.bodies[idx], store.metas[idx], META_BUF);
     snprintf(store.raws[idx], RAW_BUF, "%s", desc);
     if (idx == 0) {
         char line[240];
@@ -2868,8 +2853,7 @@ void commit_feed_item(FeedArticleStore &store, int *count,
         append_limited(store.bodies[idx], BODY_BUF, link);
     }
     store.articles[idx] = (Article){store.titles[idx], store.metas[idx], true,
-                                    store.bodies[idx],
-                                    parse_feed_date(date), store.raws[idx]};
+                                    store.bodies[idx], when, store.raws[idx]};
 }
 
 int parse_feed_xml(int feed_idx, const char *xml, int len, char *icon_out,

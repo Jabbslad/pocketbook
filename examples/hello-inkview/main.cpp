@@ -26,7 +26,7 @@ static int main_handler(int event_type, int param_one, int param_two)
     return 0;
 }
 
-int main(int argc, char **argv)
+int main()
 {
     InkViewMain(main_handler);
     return 0;

@@ -13,7 +13,6 @@
 #define STBI_NO_PNM
 #include "stb_image.h"
 
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -49,25 +48,14 @@ const char *face_for(int weight, bool italic)
 // progressive JPEGs) and box-filter to an 8-bit grayscale ibitmap.
 ibitmap *pb_decode_gray_bitmap(const char *path, int max_w, int max_h)
 {
-    int sw = 0, sh = 0, comp = 0;
+    int sw = 0, sh = 0;
     // Gray + alpha, composited over white: transparent-background logos
     // would otherwise decode on an undefined background.
-    unsigned char *ga = stbi_load(path, &sw, &sh, &comp, 2);
+    unsigned char *ga = stbi_load(path, &sw, &sh, NULL, 2);
     if (!ga || sw <= 0 || sh <= 0) {
         if (ga) stbi_image_free(ga);
         return NULL;
     }
-    unsigned char *gray = (unsigned char *)malloc((size_t)sw * sh);
-    if (!gray) {
-        stbi_image_free(ga);
-        return NULL;
-    }
-    for (size_t i = 0; i < (size_t)sw * sh; ++i) {
-        unsigned g = ga[i * 2];
-        unsigned a = ga[i * 2 + 1];
-        gray[i] = (unsigned char)((g * a + 255u * (255u - a)) / 255u);
-    }
-    stbi_image_free(ga);
 
     int dw = sw > max_w ? max_w : sw;
     int dh = (int)((long long)sh * dw / sw);
@@ -94,15 +82,20 @@ ibitmap *pb_decode_gray_bitmap(const char *path, int max_w, int max_h)
                 int sx1 = (int)((long long)(x + 1) * sw / dw);
                 if (sx1 <= sx0) sx1 = sx0 + 1;
                 long sum = 0;
-                for (int yy = sy0; yy < sy1; ++yy)
-                    for (int xx = sx0; xx < sx1; ++xx)
-                        sum += gray[(size_t)yy * sw + xx];
+                for (int yy = sy0; yy < sy1; ++yy) {
+                    for (int xx = sx0; xx < sx1; ++xx) {
+                        unsigned char *px = ga + ((size_t)yy * sw + xx) * 2;
+                        unsigned g = px[0];
+                        unsigned a = px[1];
+                        sum += (g * a + 255u * (255u - a)) / 255u;
+                    }
+                }
                 bmp->data[(size_t)y * scanline + x] =
                     (unsigned char)(sum / ((sy1 - sy0) * (sx1 - sx0)));
             }
         }
     }
-    free(gray);
+    stbi_image_free(ga);
     return bmp;
 }
 
@@ -233,7 +226,7 @@ void PbHtmlContainer::load_image(const char *src, const char * /*baseurl*/,
 {
     if (!src || !*src || !m_resolver) return;
     std::string key(src);
-    if (m_images.count(key)) return;
+    if (m_images.find(key) != m_images.end()) return;
 
     ibitmap *bmp = NULL;
     char path[512];
